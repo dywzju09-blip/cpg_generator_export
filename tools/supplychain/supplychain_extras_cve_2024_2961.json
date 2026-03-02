@@ -1,0 +1,14 @@
+{
+  "packages": [
+    { "name": "c_iconv_entry", "version": "1.0.0", "lang": "C" },
+    { "name": "c_iconv_route", "version": "1.0.0", "lang": "C" },
+    { "name": "c_iconv_codec", "version": "1.0.0", "lang": "C" },
+    { "name": "glibc", "version": "2.39", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "cve-2024-2961-poc", "to": "c_iconv_entry" },
+    { "from": "c_iconv_entry", "to": "c_iconv_route" },
+    { "from": "c_iconv_route", "to": "c_iconv_codec" },
+    { "from": "c_iconv_codec", "to": "glibc" }
+  ]
+}

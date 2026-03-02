@@ -1,0 +1,12 @@
+{
+  "packages": [
+    { "name": "c_im_entry", "version": "1.0.0", "lang": "C" },
+    { "name": "c_im_delegate", "version": "1.0.0", "lang": "C" },
+    { "name": "ImageMagick", "version": "7.1.1", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "cve-2023-34153-poc", "to": "c_im_entry" },
+    { "from": "c_im_entry", "to": "c_im_delegate" },
+    { "from": "c_im_delegate", "to": "ImageMagick" }
+  ]
+}

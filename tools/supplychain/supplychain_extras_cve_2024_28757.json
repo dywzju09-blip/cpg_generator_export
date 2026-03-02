@@ -1,0 +1,42 @@
+{
+  "packages": [
+    { "name": "compa", "version": "1.0.0", "lang": "C" },
+    { "name": "compb", "version": "1.0.0", "lang": "C" },
+    { "name": "compc", "version": "1.0.0", "lang": "C" },
+    { "name": "expat", "version": "2.6.1", "lang": "C" }
+  ],
+  "depends": [
+    {
+      "from": "crate_b",
+      "to": "compa",
+      "evidence_type": "manual",
+      "confidence": "low",
+      "source": "extras json",
+      "evidence": "ffi wrapper"
+    },
+    {
+      "from": "compa",
+      "to": "compb",
+      "evidence_type": "manual",
+      "confidence": "low",
+      "source": "extras json",
+      "evidence": "wrapper chain"
+    },
+    {
+      "from": "compb",
+      "to": "compc",
+      "evidence_type": "manual",
+      "confidence": "low",
+      "source": "extras json",
+      "evidence": "wrapper chain"
+    },
+    {
+      "from": "compc",
+      "to": "expat",
+      "evidence_type": "manual",
+      "confidence": "low",
+      "source": "extras json",
+      "evidence": "linked libexpat"
+    }
+  ]
+}

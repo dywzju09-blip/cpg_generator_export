@@ -1,0 +1,17 @@
+[
+  {
+    "cve": "CVE-2016-4449",
+    "package": "libxml2",
+    "version_range": "<2.9.4",
+    "symbols": ["xmlReadMemory"],
+    "source_status": "local",
+    "trigger_conditions": [
+      "external entity expansion via DOCTYPE",
+      "untrusted input reaches xmlReadMemory",
+      "no sanitizer on input"
+    ],
+    "source_patterns": ["get_untrusted_input", "read_from_env", "stdin"],
+    "sanitizer_patterns": ["sanitize", "validate", "escape", "xmlDisableExternalEntity"],
+    "description": "libxml2 XXE (CVE-2016-4449) before 2.9.4. Triggered via external entity expansion."
+  }
+]

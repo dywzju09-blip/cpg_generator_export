@@ -1,0 +1,2 @@
+[workspace]
+members = ["app", "crate_a", "crate_b"]

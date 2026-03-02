@@ -1,0 +1,14 @@
+[
+  {
+    "cve": "CVE-2023-34153",
+    "package": "ImageMagick",
+    "version_range": ">=7.1.0,<7.1.1.11",
+    "symbols": ["im_sim_convert"],
+    "source_status": "local",
+    "trigger_conditions": [
+      "delegate command uses user-controlled pixfmt",
+      "insufficient sanitization allows shell metacharacters"
+    ],
+    "description": "ImageMagick command injection via crafted input (CVE-2023-34153)."
+  }
+]

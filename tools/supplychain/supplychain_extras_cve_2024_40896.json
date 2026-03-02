@@ -1,0 +1,12 @@
+{
+  "packages": [
+    { "name": "c_xxe_entry", "version": "1.0.0", "lang": "C" },
+    { "name": "c_xxe_router", "version": "1.0.0", "lang": "C" },
+    { "name": "libxml2", "version": "2.12.8", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "cve-2024-40896-poc", "to": "c_xxe_entry" },
+    { "from": "c_xxe_entry", "to": "c_xxe_router" },
+    { "from": "c_xxe_router", "to": "libxml2" }
+  ]
+}

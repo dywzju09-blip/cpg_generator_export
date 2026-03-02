@@ -1,0 +1,14 @@
+[
+  {
+    "cve": "CVE-2023-52426",
+    "package": "libexpat",
+    "version_range": "<=2.5.0",
+    "symbols": ["expat_sim_parse"],
+    "source_status": "local",
+    "trigger_conditions": [
+      "XML_DTD is undefined at compile time",
+      "recursive entity expansion input (billion laughs)"
+    ],
+    "description": "Expat entity expansion DoS when XML_DTD is undefined (CVE-2023-52426)."
+  }
+]

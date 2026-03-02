@@ -1,0 +1,17 @@
+[
+  {
+    "cve": "CVE-2024-40896",
+    "package": "libxml2",
+    "version_range": "<2.13.0",
+    "symbols": ["xmlReadMemory", "xmlCtxtReadMemory", "xmlParseMemory"],
+    "source_status": "system",
+    "trigger_conditions": [
+      "XXE via XML_PARSE_NOENT | XML_PARSE_DTDLOAD",
+      "untrusted input reaches parser"
+    ],
+    "source_patterns": ["c_entry_xxe", "route_xml_to_libxml2", "payload"],
+    "sanitizer_patterns": ["xmlCtxtUseOptions", "XML_PARSE_NOENT"],
+    "context_patterns": ["xml", "parse", "read", "memory"],
+    "description": "libxml2 XXE vulnerability (CVE-2024-40896) via entity expansion."
+  }
+]

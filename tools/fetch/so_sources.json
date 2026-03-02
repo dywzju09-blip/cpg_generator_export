@@ -1,0 +1,30 @@
+{
+  "libraries": [
+    {
+      "name": "libxml2",
+      "official_url": "https://download.gnome.org/sources/libxml2/2.9/libxml2-2.9.3.tar.xz",
+      "archive": "tar.xz",
+      "so_glob": "libxml2*",
+      "output_dir": "vendor/so/libxml2-2.9.3",
+      "source_status": "binary-only",
+      "build_commands": [
+        "./configure --prefix={output_dir}/install --disable-static --without-python --without-lzma CFLAGS='-Wno-error -Wno-implicit-function-declaration -Wno-int-conversion'",
+        "make -j4",
+        "make install"
+      ]
+    },
+    {
+      "name": "expat",
+      "official_url": "https://downloads.sourceforge.net/project/expat/expat/2.6.1/expat-2.6.1-RENAMED-VULNERABLE-PLEASE-USE-2.6.2-INSTEAD.tar.xz",
+      "archive": "tar.xz",
+      "so_glob": "libexpat*",
+      "output_dir": "vendor/so/expat-2.6.1",
+      "source_status": "binary-only",
+      "build_commands": [
+        "./configure --prefix={output_dir}/install --disable-static",
+        "make -j4",
+        "make install"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "packages": [
+    {
+      "name": "cjson",
+      "version": "1.7.15",
+      "source": "vendored_source",
+      "symbols": ["cJSON_Minify", "cJSON_Parse", "cJSON_Delete"]
+    }
+  ],
+  "depends": [
+    {
+      "from": "cve-2023-50472-poc",
+      "to": "cjson"
+    }
+  ]
+}

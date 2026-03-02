@@ -1,0 +1,38 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# C/C++
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Project specific
+output/
+# Ignore generated CPGs if they appear outside output
+cpg_export/
+*.json
+!tools/**/*.json
+!vulnerabilities/**/*.json
+!so_sources.json
+!package.json
+
+# Keep vendor for reproducibility in this PoC context
+# But ignore large binaries if necessary. For now, keep them.
+# !vendor/
+
+# Temporary files
+*.log

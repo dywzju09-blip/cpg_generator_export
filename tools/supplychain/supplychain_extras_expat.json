@@ -1,0 +1,12 @@
+{
+  "packages": [
+    { "name": "c_component_a", "version": "1.0.0", "lang": "C" },
+    { "name": "c_component_b", "version": "1.0.0", "lang": "C" },
+    { "name": "expat", "version": "2.6.1", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "crate_b", "to": "c_component_a" },
+    { "from": "c_component_a", "to": "c_component_b" },
+    { "from": "c_component_b", "to": "expat" }
+  ]
+}

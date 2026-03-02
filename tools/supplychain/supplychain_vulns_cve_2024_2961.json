@@ -1,0 +1,14 @@
+[
+  {
+    "cve": "CVE-2024-2961",
+    "package": "glibc",
+    "version_range": "<=2.39",
+    "symbols": ["iconv_vuln_convert"],
+    "source_status": "local",
+    "trigger_conditions": [
+      "ISO-2022-CN-EXT conversion",
+      "escape sequence expands without bounds checks"
+    ],
+    "description": "glibc iconv heap overflow in ISO-2022-CN-EXT conversion (CVE-2024-2961)."
+  }
+]

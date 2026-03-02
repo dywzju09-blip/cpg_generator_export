@@ -1,0 +1,17 @@
+[
+  {
+    "cve": "CVE-2023-50471",
+    "package": "cjson",
+    "version_range": "<1.7.16",
+    "symbols": ["cJSON_Minify"],
+    "source_status": "vendored",
+    "trigger_conditions": [
+      "untrusted input reaches cJSON_Minify",
+      "buffer overflow via unclosed comment"
+    ],
+    "source_patterns": ["process_data", "read_input", "args", "env"],
+    "sanitizer_patterns": ["sanitize_json", "validate_json", "escape"],
+    "context_patterns": ["process", "minify", "json", "parse"],
+    "description": "cJSON heap buffer overflow (CVE-2023-50471) in cJSON_Minify."
+  }
+]
