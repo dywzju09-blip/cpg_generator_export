@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Handoff Prompter"
+  short_description: "Generate clear coding handoff prompts for agents."
+  default_prompt: "Use $agent-handoff-prompter to produce a copy-ready coding handoff prompt with target files, reasoning, expected behavior, checks, and optional Mermaid diagrams."

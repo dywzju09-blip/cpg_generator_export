@@ -1,0 +1,47 @@
+[
+  {
+    "id": "git-stack-0.10.17",
+    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream",
+    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream/src/bin/git-stack/main.rs",
+    "root": "git-stack",
+    "root_method": "main",
+    "extras": "tools/supplychain/real_apps/extras/git_stack_extras.json",
+    "vulns": "tools/supplychain/real_apps/rules/git_stack_cve_2024_24577.json"
+  },
+  {
+    "id": "cocogitto-5.2.0",
+    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream",
+    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream/src/bin/cog.rs",
+    "root": "cocogitto",
+    "root_method": "main",
+    "extras": "tools/supplychain/real_apps/extras/cocogitto_extras.json",
+    "vulns": "tools/supplychain/real_apps/rules/cocogitto_cve_2024_24575.json"
+  },
+  {
+    "id": "git-cliff-1.1.2",
+    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream",
+    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream/src/lib.rs",
+    "root": "git-cliff",
+    "root_method": "run",
+    "extras": "tools/supplychain/real_apps/extras/git_cliff_extras.json",
+    "vulns": "tools/supplychain/real_apps/rules/git_cliff_cve_2024_24577.json"
+  },
+  {
+    "id": "post_maker-0.6.3",
+    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream",
+    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream/src/main.rs",
+    "root": "post_maker",
+    "root_method": "main",
+    "extras": "tools/supplychain/real_apps/extras/post_maker_extras.json",
+    "vulns": "tools/supplychain/real_apps/rules/post_maker_cve_2023_4863.json"
+  },
+  {
+    "id": "nu_plugin_to_sqlite-0.44.0",
+    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream",
+    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream/src/main.rs",
+    "root": "nu_plugin_to_sqlite",
+    "root_method": "main",
+    "extras": "tools/supplychain/real_apps/extras/nu_sqlite_extras.json",
+    "vulns": "tools/supplychain/real_apps/rules/nu_sqlite_cve_2022_35737.json"
+  }
+]

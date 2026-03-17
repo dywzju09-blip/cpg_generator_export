@@ -1,0 +1,9 @@
+{
+  "packages": [
+    { "name": "libwebp", "version": "1.3.1", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "webp", "to": "libwebp", "evidence_type": "crate-wrapper", "confidence": "medium", "source": "cargo.lock", "evidence": "webp crate wraps libwebp" },
+    { "from": "libwebp-sys", "to": "libwebp", "evidence_type": "ffi", "confidence": "high", "source": "cargo.lock", "evidence": "libwebp-sys links libwebp" }
+  ]
+}

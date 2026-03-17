@@ -1,0 +1,71 @@
+[
+  {
+    "cve": "CVE-2022-1586",
+    "package": "pcre2-sys",
+    "version_range": "<=0.2.5",
+    "description": "PCRE2 JIT OOB-read: engine=PCRE2 + caseless + utf/ucp + jit 路径可达，且版本命中。",
+    "match": {
+      "crates": ["pcre2-sys", "pcre2", "grep-pcre2"]
+    },
+    "symbols": ["pcre2_jit_compile_8"],
+    "input_predicate": {
+      "class": "crafted_regex_pattern",
+      "strategy": "assume_if_not_explicit"
+    },
+    "trigger_model": {
+      "conditions": [
+        {
+          "id": "engine_selected",
+          "type": "any_of",
+          "conditions": [
+            { "type": "call", "name": "matcher_pcre2", "lang": "Rust" },
+            { "type": "call", "name": "build_pcre2_matcher", "lang": "Rust" },
+            { "type": "call_code_contains", "name_regex": "(?i)(^|::)(matcher|engine|build_pcre2_matcher)$", "lang": "Rust", "contains": ["pcre2"], "contains_all": false }
+          ]
+        },
+        {
+          "id": "caseless_enabled",
+          "type": "any_of",
+          "conditions": [
+            { "type": "call_code_contains", "name": "caseless", "lang": "Rust", "contains": ["true", "case_insensitive", "ignore_case"], "contains_all": false },
+            { "type": "call", "name": "caseless", "lang": "Rust" }
+          ]
+        },
+        {
+          "id": "jit_enabled",
+          "type": "any_of",
+          "conditions": [
+            { "type": "call_code_contains", "name": "jit_if_available", "lang": "Rust", "contains": ["true"], "contains_all": false },
+            { "type": "call", "name": "jit_if_available", "lang": "Rust" }
+          ]
+        },
+        {
+          "id": "utf_enabled",
+          "type": "any_of",
+          "conditions": [
+            { "type": "call_code_contains", "name": "utf", "lang": "Rust", "contains": ["true"], "contains_all": false },
+            { "type": "call", "name": "utf", "lang": "Rust" }
+          ]
+        },
+        {
+          "id": "ucp_enabled",
+          "type": "any_of",
+          "conditions": [
+            { "type": "call_code_contains", "name": "ucp", "lang": "Rust", "contains": ["true"], "contains_all": false },
+            { "type": "call", "name": "ucp", "lang": "Rust" }
+          ]
+        }
+      ],
+      "mitigations": [
+        {
+          "id": "explicit_no_unicode",
+          "type": "any_of",
+          "conditions": [
+            { "type": "control_code_contains", "contains": ["no-unicode", "no_unicode"], "contains_all": false },
+            { "type": "call_code_contains", "name": "unicode", "lang": "Rust", "contains": ["false"] }
+          ]
+        }
+      ]
+    }
+  }
+]

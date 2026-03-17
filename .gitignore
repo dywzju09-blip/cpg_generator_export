@@ -1,5 +1,6 @@
 # Rust
 target/
+**/target_cpg/
 **/*.rs.bk
 Cargo.lock
 
@@ -9,6 +10,7 @@ Cargo.lock
 *.so
 *.dylib
 *.dll
+*.rlib
 
 # Python
 __pycache__/
@@ -27,7 +29,6 @@ cpg_export/
 *.json
 !tools/**/*.json
 !vulnerabilities/**/*.json
-!so_sources.json
 !package.json
 
 # Keep vendor for reproducibility in this PoC context

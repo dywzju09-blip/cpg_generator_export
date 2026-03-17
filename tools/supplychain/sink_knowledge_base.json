@@ -1,0 +1,114 @@
+{
+  "libgit2": {
+    "match": {
+      "crates": ["git2", "libgit2-sys"]
+    },
+    "rust_sinks": [
+      {"path": "git2::Repository::revparse_single"},
+      {"path": "git2::Repository::revparse_ext"}
+    ],
+    "native_sinks": [
+      "git_revparse_single",
+      "git_revparse_ext"
+    ],
+    "symbols": [
+      "git_revparse_single",
+      "git_revparse_ext"
+    ]
+  },
+  "libwebp": {
+    "match": {
+      "crates": ["webp", "libwebp-sys"]
+    },
+    "rust_sinks": [
+      {"path": "webp::Decoder::decode"}
+    ],
+    "native_sinks": [
+      "WebPDecode",
+      "VP8LDecodeImage"
+    ],
+    "symbols": [
+      "WebPDecode"
+    ],
+    "input_predicate": {
+      "class": "crafted_webp_lossless",
+      "strategy": "assume_if_not_explicit"
+    }
+  },
+  "pcre2": {
+    "match": {
+      "crates": ["pcre2", "pcre2-sys"]
+    },
+    "rust_sinks": [
+      {"path": "RegexBuilder::build"}
+    ],
+    "native_sinks": [
+      "pcre2_jit_compile_8"
+    ],
+    "symbols": [
+      "pcre2_jit_compile_8"
+    ],
+    "env_guards": {
+      "all": [
+        {"type": "feature_enabled", "feature": "jit"}
+      ]
+    },
+    "input_predicate": {
+      "class": "crafted_regex_pattern",
+      "strategy": "assume_if_not_explicit"
+    }
+  },
+  "zlib": {
+    "match": {
+      "crates": ["libz-sys", "zlib-sys", "zlib"]
+    },
+    "rust_sinks": [
+      {"path": "libz_sys::inflateGetHeader"},
+      {"path": "libz_sys::inflate"}
+    ],
+    "native_sinks": [
+      "inflateGetHeader",
+      "inflate"
+    ],
+    "symbols": [
+      "inflateGetHeader",
+      "inflate"
+    ],
+    "trigger_model": {
+      "conditions": [
+        {
+          "id": "zlib_api_sequence",
+          "type": "api_sequence",
+          "steps": [
+            {"name": "inflateInit2_", "lang": "C"},
+            {"name": "inflateGetHeader", "lang": "C"},
+            {"name": "inflate", "lang": "C"}
+          ],
+          "scope": "any",
+          "same_method": false
+        }
+      ]
+    },
+    "input_predicate": {
+      "class": "gzip_with_crafted_extra_field",
+      "strategy": "solve_if_length_explicit_else_assume"
+    }
+  },
+  "sqlite": {
+    "match": {
+      "crates": ["rusqlite", "libsqlite3-sys"]
+    },
+    "native_sinks": [
+      "sqlite3_bind_text64",
+      "sqlite3_bind_blob64"
+    ],
+    "symbols": [
+      "sqlite3_bind_text64",
+      "sqlite3_bind_blob64"
+    ],
+    "input_predicate": {
+      "class": "extremely_large_string",
+      "strategy": "solve_if_length_explicit_else_assume"
+    }
+  }
+}

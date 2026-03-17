@@ -2,14 +2,18 @@ from neo4j import GraphDatabase
 import json
 import os
 import argparse
+import sys
 from datetime import datetime
+from pathlib import Path
 
-# Neo4j configuration
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "password")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.neo4j.config import neo4j_auth, neo4j_uri
 
 def link_cpgs(log_file):
-    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver = GraphDatabase.driver(neo4j_uri(), auth=neo4j_auth())
     
     # Link Rust CALL to C METHOD with multiple heuristics:
     # 1) exact name match

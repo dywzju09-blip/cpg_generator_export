@@ -12,6 +12,68 @@
     "source_patterns": ["c_entry_xxe", "route_xml_to_libxml2", "payload"],
     "sanitizer_patterns": ["xmlCtxtUseOptions", "XML_PARSE_NOENT"],
     "context_patterns": ["xml", "parse", "read", "memory"],
+    "trigger_model": {
+      "conditions": [],
+      "mitigations": [],
+      "param_semantics": {
+        "flags": [
+          {
+            "call": "xmlReadMemory",
+            "arg_index": 5,
+            "requires_all": ["XML_PARSE_DTDLOAD", "XML_PARSE_NOENT"],
+            "forbids": []
+          }
+        ],
+        "nonnull": [
+          {
+            "call": "xmlReadMemory",
+            "arg_index": 1,
+            "must_be": "nonnull"
+          }
+        ],
+        "abi_contracts": {
+          "ptr_len_pairs": [
+            {
+              "call": "xmlReadMemory",
+              "ptr_arg": 1,
+              "len_arg": 2,
+              "len_constraints": [
+                {
+                  "op": ">",
+                  "value": 0
+                }
+              ],
+              "null_ptr_requires_len_zero": true
+            }
+          ],
+          "nullability": [
+            {
+              "call": "xmlReadMemory",
+              "arg_index": 1,
+              "must_be": "nonnull"
+            }
+          ],
+          "flag_domain": [
+            {
+              "call": "xmlReadMemory",
+              "arg_index": 5,
+              "allowed": [
+                "XML_PARSE_DTDLOAD",
+                "XML_PARSE_NOENT",
+                "XML_PARSE_NONET"
+              ],
+              "requires_all": [
+                "XML_PARSE_DTDLOAD",
+                "XML_PARSE_NOENT"
+              ],
+              "forbids": [
+                "XML_PARSE_NONET"
+              ]
+            }
+          ]
+        }
+      }
+    },
     "description": "libxml2 XXE vulnerability (CVE-2024-40896) via entity expansion."
   }
 ]

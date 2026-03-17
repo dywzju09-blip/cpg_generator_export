@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Promot"
+  short_description: "生成清晰的代码移交提示词给 Agent。"
+  default_prompt: "使用 $codex_promot 生成一份包含目标文件、推理、预期行为、检查项和可选 Mermaid 图表的可复制的代码移交提示词。"

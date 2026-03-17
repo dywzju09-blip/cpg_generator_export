@@ -1,0 +1,9 @@
+{
+  "packages": [
+    { "name": "libgit2", "version": "1.6.3", "lang": "C" }
+  ],
+  "depends": [
+    { "from": "git2", "to": "libgit2", "evidence_type": "crate-wrapper", "confidence": "medium", "source": "cargo.lock", "evidence": "git2 crate wraps libgit2" },
+    { "from": "libgit2-sys", "to": "libgit2", "evidence_type": "ffi", "confidence": "high", "source": "cargo.lock", "evidence": "libgit2-sys links libgit2" }
+  ]
+}

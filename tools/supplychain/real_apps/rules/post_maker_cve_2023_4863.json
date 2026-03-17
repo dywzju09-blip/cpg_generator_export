@@ -1,0 +1,46 @@
+[
+  {
+    "cve": "CVE-2023-4863",
+    "package": "libwebp",
+    "version_range": "<1.3.2",
+    "description": "WebP 解码路径触发（post_maker）。",
+    "match": {
+      "crates": ["webp", "libwebp-sys"]
+    },
+    "symbols": ["WebPDecode", "VP8LDecodeImage"],
+    "rust_sinks": [
+      { "path": "webp::Decoder::new" },
+      { "path": "webp::Decoder::decode" }
+    ],
+    "input_predicate": {
+      "class": "crafted_webp_lossless",
+      "strategy": "assume_if_not_explicit"
+    },
+    "trigger_model": {
+      "conditions": [
+        {
+          "id": "webp_decode_sequence",
+          "type": "api_sequence",
+          "steps": [
+            { "name_regex": "(^|::)open$", "lang": "Rust" },
+            { "name_regex": "(^|::)read_to_end$", "lang": "Rust" },
+            { "name_regex": "(^|::)new$", "lang": "Rust" },
+            { "name_regex": "(^|::)decode$", "lang": "Rust" }
+          ],
+          "scope": "any",
+          "same_method": true
+        },
+        {
+          "id": "webp_branch_guard",
+          "type": "control_code_contains",
+          "contains": ["ImageType::Webp"],
+          "contains_all": true
+        }
+      ]
+    },
+    "must_flow": [
+      "ImageInfo.path -> File::open.arg1",
+      "File::open.bytes -> Decoder::new.arg1"
+    ]
+  }
+]

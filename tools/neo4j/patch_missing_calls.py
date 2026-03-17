@@ -1,11 +1,16 @@
 from neo4j import GraphDatabase
 import re
+import sys
+from pathlib import Path
 
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "password")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.neo4j.config import neo4j_auth, neo4j_uri
 
 def patch_missing_calls():
-    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver = GraphDatabase.driver(neo4j_uri(), auth=neo4j_auth())
     
     # e.g. "terminator: Some(Terminator { ... kind: _5 = crate_a::entry(...) ... })"
     call_pattern = re.compile(r"kind:\s*(?:_\d+\s*=\s*)?([a-zA-Z0-9_:]+)\(")

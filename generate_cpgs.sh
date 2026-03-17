@@ -1,7 +1,7 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 set -e
 
-SCRIPT_DIR="$(cd -- "${0:A:h}" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 RUST_GEN_DIR="$ROOT_DIR/rust_src"
 C_TOOLS_DIR="$ROOT_DIR/c_tools"
@@ -114,7 +114,7 @@ if [[ "$LANG" == "rust" ]]; then
 
         if [[ -d "$DEPS_DIR" ]]; then
             RUSTC_ARGS+=(--rustc-arg "-L" --rustc-arg "dependency=$DEPS_DIR")
-            setopt null_glob
+            shopt -s nullglob
             SEEN_NAMES=()
             for rlib in "$DEPS_DIR"/lib*.rlib; do
                 base="$(basename "$rlib")"
@@ -133,7 +133,7 @@ if [[ "$LANG" == "rust" ]]; then
                 SEEN_NAMES+=("$name")
                 RUSTC_ARGS+=(--rustc-arg "--extern" --rustc-arg "$name=$rlib")
             done
-            unsetopt null_glob
+            shopt -u nullglob
         fi
     fi
 
@@ -169,7 +169,7 @@ elif [[ "$LANG" == "c" ]]; then
     python3 "$C_TOOLS_DIR/convert_graphml_to_json.py" \
         "$EXPORT_DIR" \
         "$JSON_OUTPUT" \
-        --include-nodes "METHOD,CALL,BLOCK,IDENTIFIER,LITERAL,METHOD_RETURN,METHOD_PARAMETER_IN" \
+        --include-nodes "METHOD,CALL,BLOCK,CONTROL_STRUCTURE,LOCAL,RETURN,IDENTIFIER,LITERAL,METHOD_RETURN,METHOD_PARAMETER_IN" \
         --include-edges "AST,CALL,CFG,CFG_UNWIND,ARGUMENT,DDG,DOMINATE,POST_DOMINATE,REACHING_DEF,CONTAINS,BINDS,REF"
 
     echo "[+] C CPG saved to: $JSON_OUTPUT"

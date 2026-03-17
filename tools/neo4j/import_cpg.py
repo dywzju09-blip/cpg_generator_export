@@ -2,13 +2,25 @@ from neo4j import GraphDatabase
 import json
 import argparse
 import sys
+from collections import defaultdict
+from pathlib import Path
 
-# Neo4j configuration
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "password")  # Change if you have a password
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.neo4j.config import neo4j_auth, neo4j_uri
+
+DEFAULT_BATCH_SIZE = 1000
+
+
+def chunked(items, size):
+    for idx in range(0, len(items), size):
+        yield items[idx: idx + size]
+
 
 def import_json_to_neo4j(json_file, clear_db, id_offset, label_tag):
-    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver = GraphDatabase.driver(neo4j_uri(), auth=neo4j_auth())
 
     with open(json_file, 'r') as f:
         data = json.load(f)
@@ -29,44 +41,63 @@ def import_json_to_neo4j(json_file, clear_db, id_offset, label_tag):
         else:
             print("Incremental import (DB not cleared).")
 
-        # Import Nodes
+        if label_tag:
+            try:
+                session.run(f"CREATE INDEX node_id_{label_tag.lower()} IF NOT EXISTS FOR (n:{label_tag}) ON (n.id)")
+                print(f"Ensured index: :{label_tag}(id)")
+            except Exception as exc:
+                print(f"[WARN] Failed to create index on :{label_tag}(id): {exc}")
+
+        # Import Nodes (grouped by labels for batched UNWIND import)
         print(f"Importing {len(nodes)} nodes...")
+        nodes_by_label = defaultdict(list)
         for node in nodes:
-            # Shift ID
-            original_id = node['id']
+            original_id = node["id"]
             new_id = original_id + id_offset
-            
-            # Prepare properties
-            props = {k: v for k, v in node.items() if k != 'id' and k != 'label'}
-            props['id'] = new_id
-            props['original_id'] = original_id # Keep track of original ID
-            
-            # Construct labels: Original Label + Optional Tag
-            labels = [node['label']]
+            props = {k: v for k, v in node.items() if k not in {"id", "label"}}
+            props["id"] = new_id
+            props["original_id"] = original_id
+
+            labels = [node["label"]]
             if label_tag:
                 labels.append(label_tag)
-            
             label_str = ":".join(labels)
-            
-            # Use MERGE to avoid duplicates if re-running without clear
-            query = f"MERGE (n:{label_str} {{id: $id}}) SET n += $props"
-            session.run(query, id=new_id, props=props)
+            nodes_by_label[label_str].append({"id": new_id, "props": props})
 
-        # Import Edges
+        node_query_template = "UNWIND $rows AS row MERGE (n:{labels} {{id: row.id}}) SET n += row.props"
+        for labels, rows in nodes_by_label.items():
+            query = node_query_template.format(labels=labels)
+            for batch in chunked(rows, DEFAULT_BATCH_SIZE):
+                session.run(query, rows=batch)
+
+        # Import Edges (grouped by edge type for batched UNWIND import)
         print(f"Importing {len(edges)} edges...")
+        edges_by_type = defaultdict(list)
         for edge in edges:
             src_id = edge['src'] + id_offset
             dst_id = edge['dst'] + id_offset
             edge_type = edge['label']
             props = edge.get('properties', {})
-            
-            # Create relationship with properties
-            query = (
-                f"MATCH (a {{id: $src_id}}), (b {{id: $dst_id}}) "
-                f"MERGE (a)-[r:`{edge_type}`]->(b) "
-                f"SET r += $props"
-            )
-            session.run(query, src_id=src_id, dst_id=dst_id, props=props)
+            edges_by_type[edge_type].append({
+                "src_id": src_id,
+                "dst_id": dst_id,
+                "props": props,
+            })
+
+        node_match = "(a {id: row.src_id}), (b {id: row.dst_id})"
+        if label_tag:
+            node_match = f"(a:{label_tag} {{id: row.src_id}}), (b:{label_tag} {{id: row.dst_id}})"
+
+        edge_query_template = (
+            "UNWIND $rows AS row "
+            f"MATCH {node_match} "
+            "MERGE (a)-[r:`__EDGE_TYPE__`]->(b) "
+            "SET r += row.props"
+        )
+        for edge_type, rows in edges_by_type.items():
+            query = edge_query_template.replace("__EDGE_TYPE__", edge_type)
+            for batch in chunked(rows, DEFAULT_BATCH_SIZE):
+                session.run(query, rows=batch)
 
     driver.close()
     print("Import finished successfully.")

@@ -1,0 +1,23 @@
+[
+  {
+    "cve": "CVE-2022-35737",
+    "package": "sqlite",
+    "version_range": "<3.39.2",
+    "description": "SQLite 大字符串相关触发路径（nu_plugin_to_sqlite）。",
+    "match": {
+      "crates": ["rusqlite", "libsqlite3-sys"]
+    },
+    "symbols": ["sqlite3_bind_text64", "sqlite3_bind_blob64", "sqlite3_exec"],
+    "rust_sinks": [
+      { "path": "rusqlite::Connection::execute" }
+    ],
+    "input_predicate": {
+      "class": "extremely_large_string",
+      "strategy": "solve_if_length_explicit_else_assume"
+    },
+    "must_flow": [
+      "table_name -> execute.arg1",
+      "insert_values -> execute.arg1"
+    ]
+  }
+]

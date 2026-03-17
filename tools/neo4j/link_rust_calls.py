@@ -1,10 +1,15 @@
 from neo4j import GraphDatabase
+import sys
+from pathlib import Path
 
-URI = "bolt://localhost:7687"
-AUTH = ("neo4j", "password")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.neo4j.config import neo4j_auth, neo4j_uri
 
 def link_rust_calls():
-    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver = GraphDatabase.driver(neo4j_uri(), auth=neo4j_auth())
     
     query = """
     MATCH (c:CALL:Rust), (m:METHOD:Rust)

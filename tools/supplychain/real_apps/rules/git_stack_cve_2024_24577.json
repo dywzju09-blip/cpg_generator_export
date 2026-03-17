@@ -1,0 +1,24 @@
+[
+  {
+    "cve": "CVE-2024-24577",
+    "package": "libgit2",
+    "version_range": "<1.7.2",
+    "description": "libgit2 revparse 相关触发路径（git-stack）。",
+    "match": {
+      "crates": ["git2", "libgit2-sys"]
+    },
+    "symbols": ["git_revparse_single", "git_revparse_ext"],
+    "rust_sinks": [
+      { "path": "git2::Repository::revparse_single" },
+      { "path": "git2::Repository::revparse_ext" }
+    ],
+    "input_predicate": {
+      "class": "crafted_revspec",
+      "strategy": "assume_if_not_explicit"
+    },
+    "must_flow": [
+      "Option<String>.as_deref -> revparse_ext.arg1",
+      "revspec -> revparse_single.arg1"
+    ]
+  }
+]

@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "name": "zlib",
+      "package_aliases": [
+        "libz-sys",
+        "zlib-sys",
+        "zlib-ng-sys"
+      ],
+      "ecosystem": "C",
+      "language": "C",
+      "version": "1.2.12",
+      "version_range": "<=1.2.12",
+      "summary_source": "manual",
+      "notes": "Seeded from CVE-2022-37434 zlib/libz-sys analysis.",
+      "call_aliases": {
+        "z_inflateGetHeader": "inflateGetHeader",
+        "z_inflate": "inflate"
+      },
+      "internal_bindings": [
+        {
+          "id": "zlib_wrapper_inflate",
+          "entry_call": "z_inflate",
+          "bind_call": "inflate",
+          "param_map": {
+            "1": "1"
+          },
+          "allow_create_entry": true,
+          "reason": "Wrapper symbol forwards stream pointer to inflate."
+        }
+      ],
+      "summaries": {
+        "inflateGetHeader": {
+          "lang": "Rust",
+          "abi_name": "inflateGetHeader",
+          "params": {
+            "2": {
+              "role": "gzip_header",
+              "arg_shape": "rust_mut_ref_or_c_mut_ptr",
+              "abi_kind": "mut_ptr",
+              "type": "gz_header*",
+              "pointee_type": "gz_header",
+              "fields": {
+                "extra": {
+                  "kind": "ptr",
+                  "state": "pre"
+                },
+                "extra_max": {
+                  "kind": "len",
+                  "state": "pre"
+                },
+                "extra_len": {
+                  "kind": "len",
+                  "state": "post",
+                  "source": "attacker_controlled"
+                },
+                "done": {
+                  "kind": "flag",
+                  "state": "post"
+                }
+              }
+            }
+          }
+        },
+        "inflate": {
+          "lang": "Rust",
+          "abi_name": "inflate",
+          "params": {
+            "1": {
+              "role": "z_stream",
+              "arg_shape": "rust_mut_ref_or_c_mut_ptr",
+              "abi_kind": "mut_ptr",
+              "type": "z_stream*",
+              "pointee_type": "z_stream"
+            }
+          }
+        },
+        "inflateInit2_": {
+          "lang": "Rust",
+          "abi_name": "inflateInit2_",
+          "params": {
+            "1": {
+              "role": "z_stream",
+              "arg_shape": "rust_mut_ref_or_c_mut_ptr",
+              "abi_kind": "mut_ptr",
+              "type": "z_stream*",
+              "pointee_type": "z_stream"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
