@@ -1,0 +1,7 @@
+interface:
+  display_name: "Find_proj"
+  short_description: "Find new vulnerability projects not seen before"
+  default_prompt: "Use $find-proj to find Rust and native CVE project candidates that do not already exist in the current workspace."
+
+policy:
+  allow_implicit_invocation: true

@@ -15,6 +15,7 @@
 - `rust_src/`: Rust CPG 生成器源码
 - `c_tools/`: C 侧辅助工具
 - `docs/`: 设计说明、规则说明和任务模板
+- `skills/`: 可复用的 Codex skills，包括 `find-proj` 等流程模板
 - `tools/deploy/`: Linux 迁移、打包和批量运行脚本
 - `output/vulnerability_runs/new_projects_sweep/`: 最近一次批量检测结果
 - `PROJECT_RULES.md`: 仓库级约束
