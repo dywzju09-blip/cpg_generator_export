@@ -19,17 +19,21 @@ import json
 import os
 import re
 import shutil
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 
-ROOT_DEFAULT = Path(
-    os.environ.get(
-        "SUPPLYCHAIN_ARCHIVE_ROOT",
-        "/Users/dingyanwen/Desktop/VUL/cases/by-analysis-status",
-    )
-)
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.common.path_defaults import infer_archive_root
+
+
+ROOT_DEFAULT = infer_archive_root(REPO_ROOT)
 
 
 CATEGORY_LABELS = {

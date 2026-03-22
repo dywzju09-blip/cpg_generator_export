@@ -212,8 +212,8 @@ def _build_libwebp_rule(item: dict[str, Any]) -> dict[str, Any]:
         "rust_sinks": [
             {"path": "webp::Decoder::new"},
             {"path": "webp::Decoder::decode"},
-            {"path": "Decoder::new"},
-            {"path": "Decoder::decode"},
+            {"path": "Decoder::new", "context_tokens": ["webp"], "contains": ["decode"], "contains_all": False},
+            {"path": "Decoder::decode", "context_tokens": ["webp"]},
         ],
         "input_predicate": {
             "class": "crafted_webp_lossless",
@@ -269,8 +269,8 @@ def _build_pcre2_rule(item: dict[str, Any]) -> dict[str, Any]:
         "source_status": "system",
         "enforce_rust_sinks": True,
         "rust_sinks": [
-            {"path": "pcre2::bytes::RegexBuilder::build"},
-            {"path": "RegexBuilder::build"},
+            {"path": "pcre2::bytes::RegexBuilder::build", "contains": ["jit_if_available"], "contains_all": False},
+            {"path": "RegexBuilder::build", "context_tokens": ["pcre2"], "contains": ["jit_if_available"], "contains_all": False},
             {"path": "grep_pcre2::RegexMatcherBuilder::build"},
         ],
         "env_guards": {
@@ -285,6 +285,41 @@ def _build_pcre2_rule(item: dict[str, Any]) -> dict[str, Any]:
             "strategy": "assume_if_not_explicit",
         },
         "context_patterns": list(dict.fromkeys(["pcre2", "regex", "jit", "pattern", "grep", "match"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "pcre2_jit_builder_chain",
+                    "type": "any_of",
+                    "conditions": [
+                        {
+                            "id": "pcre2_jit_builder_flags",
+                            "type": "builder_flag_chain",
+                            "sink": {"name": "RegexBuilder::build", "lang": "Rust"},
+                            "setters": [
+                                {"name": "jit_if_available", "lang": "Rust", "contains": ["true"], "contains_all": False},
+                            ],
+                        },
+                        {
+                            "id": "pcre2_jit_build_snippet",
+                            "type": "call_code_contains",
+                            "name": "RegexBuilder::build",
+                            "lang": "Rust",
+                            "contains": ["jit_if_available", "pcre2", "RegexBuilder"],
+                            "contains_all": False,
+                        },
+                    ],
+                },
+                {
+                    "id": "pcre2_pattern_input",
+                    "type": "input_class",
+                    "class": "crafted_regex_pattern",
+                    "positive_tokens": ["regex", "pattern", "jit", "pcre2"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "PCRE2", "Generic PCRE2 JIT compile path"),
     }
 
@@ -309,6 +344,10 @@ def _build_sqlite_rule(item: dict[str, Any]) -> dict[str, Any]:
             {"path": "rusqlite::Connection::execute_batch"},
             {"path": "rusqlite::Statement::execute"},
             {"path": "Connection::execute"},
+            {"path": "rusqlite::Connection::query_row"},
+            {"path": "rusqlite::Connection::query_map"},
+            {"path": "rusqlite::Statement::query"},
+            {"path": "rusqlite::Connection::prepare"},
         ],
         "input_predicate": {
             "class": "extremely_large_string",
@@ -317,6 +356,31 @@ def _build_sqlite_rule(item: dict[str, Any]) -> dict[str, Any]:
             "strategy": "solve_if_length_explicit_else_assume",
         },
         "context_patterns": list(dict.fromkeys(["sqlite", "sql", "query", "execute", "blob", "text", "string"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "sqlite_exec_any",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "sqlite_execute", "type": "call", "name": "execute", "lang": "Rust"},
+                        {"id": "sqlite_execute_batch", "type": "call", "name": "execute_batch", "lang": "Rust"},
+                        {"id": "sqlite_query_row", "type": "call", "name": "query_row", "lang": "Rust"},
+                        {"id": "sqlite_query_map", "type": "call", "name": "query_map", "lang": "Rust"},
+                        {"id": "sqlite_statement_query", "type": "call", "name": "Statement::query", "lang": "Rust"},
+                        {"id": "sqlite_prepare", "type": "call", "name": "prepare", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "sqlite_large_string",
+                    "type": "input_class",
+                    "class": "extremely_large_string",
+                    "positive_tokens": ["sql", "sqlite", "query", "insert", "text", "string", "blob"],
+                    "negative_tokens": [],
+                    "strategy": "solve_if_length_explicit_else_assume",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "SQLite", "Generic SQLite large text/blob bind path"),
     }
 
@@ -428,8 +492,10 @@ def _build_libjpeg_turbo_rule(item: dict[str, Any]) -> dict[str, Any]:
         "rust_sinks": [
             {"path": "turbojpeg::Decompressor::read_header"},
             {"path": "turbojpeg::Decompressor::decompress"},
-            {"path": "Decompressor::read_header"},
-            {"path": "Decompressor::decompress"},
+            {"path": "turbojpeg::decompress_image"},
+            {"path": "Decompressor::read_header", "context_tokens": ["turbojpeg"]},
+            {"path": "Decompressor::decompress", "context_tokens": ["turbojpeg"]},
+            {"path": "decompress_image", "context_tokens": ["turbojpeg"]},
         ],
         "input_predicate": {
             "class": "crafted_jpeg_image",
@@ -438,6 +504,28 @@ def _build_libjpeg_turbo_rule(item: dict[str, Any]) -> dict[str, Any]:
             "strategy": "assume_if_not_explicit",
         },
         "context_patterns": list(dict.fromkeys(["jpeg", "jpg", "mjpeg", "turbojpeg", "image", "decode"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "jpeg_header_any",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "read_header", "type": "call", "name": "Decompressor::read_header", "lang": "Rust"},
+                        {"id": "decompress", "type": "call", "name": "Decompressor::decompress", "lang": "Rust"},
+                        {"id": "decompress_image", "type": "call", "name": "decompress_image", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "jpeg_input",
+                    "type": "input_class",
+                    "class": "crafted_jpeg_image",
+                    "positive_tokens": ["jpeg", "jpg", "mjpeg", "turbojpeg", "image", "decode"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "libjpeg-turbo", "Generic JPEG decode path via turbojpeg"),
     }
 
@@ -501,16 +589,20 @@ def _build_openh264_rule(item: dict[str, Any]) -> dict[str, Any]:
         "source_status": "binary-only",
         "enforce_rust_sinks": True,
         "rust_sinks": [
+            {"path": "openh264::decoder::Decoder::decode"},
             {
                 "path": "Decoder::decode",
+                "context_tokens": ["openh264"],
                 "contains": ["packet", "buf", "bytes", "nal", "frame", "sample", "as_slice"],
                 "contains_all": False,
             },
+            {"path": "OpenH264API::from_source", "context_tokens": ["openh264"]},
+            {"path": "Decoder::with_api_config", "context_tokens": ["openh264"]},
         ],
         "input_predicate": {
             "class": "crafted_h264_bitstream",
-            "positive_tokens": ["h264", "nal", "annexb", "annex-b", "packet", "video", "rtp"],
-            "negative_tokens": [],
+            "positive_tokens": ["openh264", "h264", "nal", "annexb", "annex-b", "decode"],
+            "negative_tokens": ["gstreamer", "avdec_h264", "rtph264depay", "webrtc"],
             "strategy": "assume_if_not_explicit",
         },
         "trigger_conditions": [
@@ -524,7 +616,8 @@ def _build_openh264_rule(item: dict[str, Any]) -> dict[str, Any]:
                     "id": "openh264_input_context",
                     "type": "input_class",
                     "class": "crafted_h264_bitstream",
-                    "positive_tokens": ["h264", "nal", "video", "packet", "annexb", "annex-b", "rtp"],
+                    "positive_tokens": ["openh264", "h264", "nal", "annexb", "annex-b", "decode"],
+                    "negative_tokens": ["gstreamer", "avdec_h264", "rtph264depay", "webrtc"],
                     "strategy": "assume_if_not_explicit",
                 },
             ],

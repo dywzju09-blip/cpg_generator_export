@@ -5,6 +5,12 @@ import tarfile
 import urllib.request
 import zipfile
 
+from tools.fetch.native_source_providers import (
+    canonical_component_name,
+    get_provider,
+    infer_source_dependencies,
+)
+
 
 _C_FAMILY_EXTENSIONS = {
     ".c",
@@ -18,36 +24,8 @@ _C_FAMILY_EXTENSIONS = {
 }
 
 
-_COMPONENT_REGISTRY = {
-    "openh264-sys2": {
-        "aliases": ["openh264-sys2", "openh264"],
-        "local_dirs": ["upstream"],
-        "official": None,
-    },
-    "libwebp": {
-        "aliases": ["libwebp", "libwebp-sys", "webp"],
-        "local_dirs": ["vendor"],
-        "official": None,
-    },
-    "libxml2": {
-        "aliases": ["libxml2", "libxml"],
-        "local_dirs": [],
-        "official": "libxml2",
-    },
-}
-
-
 def _normalize_component(component):
-    return str(component or "").strip().lower()
-
-
-def _registry_entry(component):
-    normalized = _normalize_component(component)
-    for entry in _COMPONENT_REGISTRY.values():
-        aliases = {str(alias).strip().lower() for alias in entry.get("aliases") or []}
-        if normalized in aliases:
-            return entry
-    return None
+    return canonical_component_name(component).strip().lower()
 
 
 def _has_c_family_files(root_dir):
@@ -74,24 +52,27 @@ def _dedupe_paths(paths):
 
 
 def find_local_native_source_tree(component, manifest_paths):
-    entry = _registry_entry(component)
-    if not entry:
+    provider = get_provider(component)
+    if not provider:
         return None
-    local_dirs = list(entry.get("local_dirs") or [])
+    local_dirs = list(provider.local_dirs or [])
     if not local_dirs:
         return None
 
+    canonical = provider.name
     for manifest_path in _dedupe_paths(manifest_paths):
         crate_dir = os.path.dirname(manifest_path)
         for rel_dir in local_dirs:
             candidate = os.path.join(crate_dir, rel_dir)
             if _has_c_family_files(candidate):
+                validation = provider.validate_source_tree(candidate)
                 return {
                     "status": "local",
                     "provenance": "bundled-local",
                     "source_root": os.path.abspath(candidate),
-                    "component": component,
+                    "component": canonical,
                     "download_url": None,
+                    "validation": validation,
                 }
     return None
 
@@ -117,52 +98,41 @@ def _download_file(url, out_path):
         shutil.copyfileobj(response, handle)
 
 
-def _libxml2_official_candidates(version):
-    version_text = str(version or "").strip()
-    if not re.match(r"^\d+\.\d+\.\d+$", version_text):
-        return []
-    parts = version_text.split(".")
-    branch = ".".join(parts[:2])
-    return [
-        {
-            "url": f"https://download.gnome.org/sources/libxml2/{branch}/libxml2-{version_text}.tar.xz",
-            "archive_name": f"libxml2-{version_text}.tar.xz",
-        },
-        {
-            "url": f"https://download.gnome.org/sources/libxml2/{branch}/libxml2-{version_text}.tar.gz",
-            "archive_name": f"libxml2-{version_text}.tar.gz",
-        },
-    ]
-
-
 def _official_source_candidates(component, version):
-    entry = _registry_entry(component)
-    if not entry:
+    provider = get_provider(component)
+    if not provider:
         return []
-    official_kind = entry.get("official")
-    if official_kind == "libxml2":
-        return _libxml2_official_candidates(version)
-    return []
+    return provider.official_candidates(version)
 
 
-def _find_extracted_source_root(root_dir):
+def _find_extracted_source_root(root_dir, component=""):
+    provider = get_provider(component)
     if _has_c_family_files(root_dir):
         return root_dir
+    candidates = []
     for name in sorted(os.listdir(root_dir)):
         candidate = os.path.join(root_dir, name)
         if os.path.isdir(candidate) and _has_c_family_files(candidate):
-            return candidate
-    return None
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    if provider:
+        for candidate in candidates:
+            validation = provider.validate_source_tree(candidate)
+            if validation.get("status") == "ok":
+                return candidate
+    return candidates[0]
 
 
 def download_official_native_source(component, version, cache_root):
+    provider = get_provider(component)
     candidates = _official_source_candidates(component, version)
-    if not candidates:
+    if not provider or not candidates:
         return {
             "status": "unsupported",
             "provenance": "downloaded-official",
             "source_root": None,
-            "component": component,
+            "component": canonical_component_name(component),
             "download_url": None,
             "reason": "official_download_not_supported",
         }
@@ -174,14 +144,16 @@ def download_official_native_source(component, version, cache_root):
     archive_dir = os.path.join(base_dir, "archives")
     os.makedirs(archive_dir, exist_ok=True)
 
-    cached_root = _find_extracted_source_root(source_dir) if os.path.isdir(source_dir) else None
+    cached_root = _find_extracted_source_root(source_dir, provider.name) if os.path.isdir(source_dir) else None
     if cached_root:
+        validation = provider.validate_source_tree(cached_root)
         return {
             "status": "downloaded",
             "provenance": "downloaded-official",
             "source_root": os.path.abspath(cached_root),
-            "component": component,
+            "component": provider.name,
             "download_url": None,
+            "validation": validation,
         }
 
     last_error = None
@@ -195,14 +167,16 @@ def download_official_native_source(component, version, cache_root):
                 shutil.rmtree(source_dir)
             os.makedirs(source_dir, exist_ok=True)
             _extract_archive(archive_path, source_dir)
-            extracted_root = _find_extracted_source_root(source_dir)
+            extracted_root = _find_extracted_source_root(source_dir, provider.name)
             if extracted_root:
+                validation = provider.validate_source_tree(extracted_root)
                 return {
                     "status": "downloaded",
                     "provenance": "downloaded-official",
                     "source_root": os.path.abspath(extracted_root),
-                    "component": component,
+                    "component": provider.name,
                     "download_url": url,
+                    "validation": validation,
                 }
             last_error = "no_c_family_files_after_extract"
         except Exception as exc:
@@ -212,7 +186,7 @@ def download_official_native_source(component, version, cache_root):
         "status": "failed",
         "provenance": "downloaded-official",
         "source_root": None,
-        "component": component,
+        "component": provider.name,
         "download_url": None,
         "reason": last_error or "download_failed",
     }
@@ -228,7 +202,7 @@ def ensure_native_source_tree(component, version, manifest_paths, cache_root, al
         "status": "unavailable",
         "provenance": "none",
         "source_root": None,
-        "component": component,
+        "component": canonical_component_name(component),
         "download_url": None,
         "reason": "download_disabled",
     }
@@ -291,3 +265,7 @@ def choose_c_analysis_scope(source_root, symbol_files):
     if common_dir and common_dir.startswith(root):
         return common_dir
     return root
+
+
+def infer_native_source_dependencies(component, source_root):
+    return infer_source_dependencies(source_root, component)

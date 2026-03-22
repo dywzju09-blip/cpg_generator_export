@@ -15,6 +15,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from tools.neo4j.config import neo4j_auth, neo4j_uri
+from tools.supplychain.vuln_db import default_component_kb_path, default_runtime_rules_path
 
 try:
     from tools.verification.path_solver import PathConstraintSolver, extract_numeric_constraints
@@ -51,24 +52,33 @@ try:
         choose_c_analysis_scope,
         ensure_native_source_tree,
         find_symbol_source_files,
+        infer_native_source_dependencies,
     )
 except Exception:
     choose_c_analysis_scope = None
     ensure_native_source_tree = None
     find_symbol_source_files = None
+    infer_native_source_dependencies = None
+
+try:
+    from tools.fetch.native_symbol_resolver import resolve_strict_native_dependencies
+except Exception:
+    resolve_strict_native_dependencies = None
 
 # Neo4j configuration
 URI = neo4j_uri()
 AUTH = neo4j_auth()
 
 DEFAULT_DEPS = ""
-DEFAULT_VULNS = "tools/supplychain/supplychain_vulns_libxml2.json"
+DEFAULT_VULNS = str(default_runtime_rules_path().relative_to(REPO_ROOT))
 DEFAULT_REPORT = "output/analysis_report.json"
-DEFAULT_SINK_KB = "tools/supplychain/sink_knowledge_base.json"
+DEFAULT_SINK_KB = str(default_component_kb_path().relative_to(REPO_ROOT))
 
 SUPPLYCHAIN_REL_TYPES = [
     "DEPENDS_ON", "HAS_VERSION", "EXPOSES_VULN",
-    "PROVIDES_SYMBOL", "RESOLVES_TO", "USES_SYMBOL", "PKG_CALL"
+    "PROVIDES_SYMBOL", "RESOLVES_TO", "USES_SYMBOL", "PKG_CALL",
+    "NATIVE_DEPENDS_ON", "NATIVE_CALL",
+    "HAS_BINARY", "EXPORTS_SYMBOL", "IMPORTS_SYMBOL", "RESOLVES_EXTERN_TO", "RESOLVES_TO_EXPORT",
 ]
 
 def parse_version(v):
@@ -95,28 +105,41 @@ def cmp_version(a, b):
 def version_in_range(version, range_expr):
     if not range_expr:
         return True
-    clauses = [c.strip() for c in range_expr.split(",") if c.strip()]
-    for clause in clauses:
-        if clause.startswith(">="):
-            if cmp_version(version, clause[2:]) < 0:
-                return False
-        elif clause.startswith(">"):
-            if cmp_version(version, clause[1:]) <= 0:
-                return False
-        elif clause.startswith("<="):
-            if cmp_version(version, clause[2:]) > 0:
-                return False
-        elif clause.startswith("<"):
-            if cmp_version(version, clause[1:]) >= 0:
-                return False
-        elif clause.startswith("=="):
-            if cmp_version(version, clause[2:]) != 0:
-                return False
-        else:
-            # Fallback: exact match
-            if cmp_version(version, clause) != 0:
-                return False
-    return True
+    groups = [group.strip() for group in str(range_expr).split("||") if group.strip()]
+    if not groups:
+        groups = [str(range_expr)]
+    for group in groups:
+        matched = True
+        clauses = [c.strip() for c in group.split(",") if c.strip()]
+        for clause in clauses:
+            if clause.startswith(">="):
+                if cmp_version(version, clause[2:]) < 0:
+                    matched = False
+                    break
+            elif clause.startswith(">"):
+                if cmp_version(version, clause[1:]) <= 0:
+                    matched = False
+                    break
+            elif clause.startswith("<="):
+                if cmp_version(version, clause[2:]) > 0:
+                    matched = False
+                    break
+            elif clause.startswith("<"):
+                if cmp_version(version, clause[1:]) >= 0:
+                    matched = False
+                    break
+            elif clause.startswith("=="):
+                if cmp_version(version, clause[2:]) != 0:
+                    matched = False
+                    break
+            else:
+                # Fallback: exact match
+                if cmp_version(version, clause) != 0:
+                    matched = False
+                    break
+        if matched:
+            return True
+    return False
 
 def load_json(path):
     with open(path, "r") as f:
@@ -451,6 +474,240 @@ def annotate_imported_c_nodes(
     )
 
 
+def ensure_package_version_node(session, package_name, *, lang="C", version=None, version_source="", extra_props=None):
+    props = dict(extra_props or {})
+    session.run(
+        """
+        MERGE (p:PACKAGE {name: $name})
+        SET p.lang = coalesce(p.lang, $lang)
+        SET p += $props
+        """,
+        name=package_name,
+        lang=lang,
+        props=props,
+    )
+    if version:
+        session.run(
+            """
+            MERGE (v:VERSION {semver: $version})
+            WITH v
+            MATCH (p:PACKAGE {name: $name})
+            MERGE (p)-[:HAS_VERSION]->(v)
+            SET v.source = coalesce(v.source, $version_source)
+            """,
+            name=package_name,
+            version=version,
+            version_source=version_source or "",
+        )
+
+
+def attach_vulnerability_to_component(session, vuln_rule, component, resolved_version):
+    cve = str(vuln_rule.get("cve") or "").strip()
+    if not cve or not component:
+        return
+    ensure_package_version_node(session, component, lang="C", version=resolved_version or None, version_source="native-source")
+    if resolved_version and version_in_range(resolved_version, vuln_rule.get("version_range", "")):
+        session.run(
+            """
+            MATCH (p:PACKAGE {name: $pkg})
+            MATCH (vuln:VULNERABILITY {cve: $cve})
+            MATCH (ver:VERSION {semver: $ver})
+            MERGE (p)-[:HAS_VERSION]->(ver)
+            MERGE (ver)-[:EXPOSES_VULN]->(vuln)
+            """,
+            pkg=component,
+            cve=cve,
+            ver=resolved_version,
+        )
+    else:
+        session.run(
+            """
+            MATCH (p:PACKAGE {name: $pkg})
+            MATCH (vuln:VULNERABILITY {cve: $cve})
+            MERGE (p)-[:EXPOSES_VULN]->(vuln)
+            """,
+            pkg=component,
+            cve=cve,
+        )
+
+
+def create_native_depends_on(session, parent_component, child_component, *, evidence_type="source-scan", confidence="medium", source="native-source", evidence=""):
+    if not parent_component or not child_component or parent_component == child_component:
+        return
+    ensure_package_version_node(session, parent_component, lang="C")
+    ensure_package_version_node(session, child_component, lang="C")
+    session.run(
+        """
+        MATCH (a:PACKAGE {name: $parent})
+        MATCH (b:PACKAGE {name: $child})
+        MERGE (a)-[r:NATIVE_DEPENDS_ON]->(b)
+        SET r.evidence_type = coalesce(r.evidence_type, $evidence_type),
+            r.confidence = coalesce(r.confidence, $confidence),
+            r.source = coalesce(r.source, $source),
+            r.evidence = coalesce(r.evidence, $evidence)
+        """,
+        parent=parent_component,
+        child=child_component,
+        evidence_type=evidence_type,
+        confidence=confidence,
+        source=source,
+        evidence=evidence or "",
+    )
+
+
+def build_native_pkg_edges(session):
+    session.run(
+        """
+        MATCH (owner:METHOD:C)-[:AST*0..40]->(call:CALL:C)-[:CALL]->(callee:METHOD:C)
+        WHERE coalesce(owner.package, "") <> ""
+          AND coalesce(callee.package, "") <> ""
+          AND owner.package <> callee.package
+        MATCH (p1:PACKAGE {name: owner.package})
+        MATCH (p2:PACKAGE {name: callee.package})
+        MERGE (p1)-[r:NATIVE_CALL]->(p2)
+        SET r.derived = true
+        """
+    )
+
+
+def register_binary_symbol_inventory(session, component, strict_resolution):
+    if not component:
+        return {"binaries": 0, "imports": 0, "exports": 0}
+    detail = dict(strict_resolution or {})
+    binaries = list(detail.get("binaries") or [])
+    imports_by_binary = dict(detail.get("imports_by_binary") or {})
+    dependency_rows = list(detail.get("dependencies") or [])
+
+    export_edges = 0
+    import_edges = 0
+    for binary in binaries:
+        session.run(
+            """
+            MERGE (p:PACKAGE {name: $component})
+            SET p.lang = coalesce(p.lang, "C")
+            MERGE (b:BINARY {path: $path})
+            SET b.component = $component
+            MERGE (p)-[:HAS_BINARY]->(b)
+            """,
+            component=component,
+            path=binary,
+        )
+    for binary, symbols in imports_by_binary.items():
+        for symbol in list(symbols or [])[:256]:
+            import_edges += 1
+            session.run(
+                """
+                MATCH (b:BINARY {path: $path})
+                MERGE (s:SYMBOL:IMPORTED_SYMBOL {name: $symbol, binary_path: $path, package: $component})
+                SET s.lang = "C"
+                MERGE (b)-[:IMPORTS_SYMBOL]->(s)
+                """,
+                path=binary,
+                symbol=symbol,
+                component=component,
+            )
+
+    for row in dependency_rows:
+        child_component = str(row.get("component") or "").strip()
+        provider_binaries = list(row.get("provider_binaries") or [])
+        provider_exports = list(row.get("provider_export_sample") or [])
+        if not child_component:
+            continue
+        for provider_binary in provider_binaries:
+            session.run(
+                """
+                MERGE (p:PACKAGE {name: $component})
+                SET p.lang = coalesce(p.lang, "C")
+                MERGE (b:BINARY {path: $path})
+                SET b.component = $component
+                MERGE (p)-[:HAS_BINARY]->(b)
+                """,
+                component=child_component,
+                path=provider_binary,
+            )
+        for symbol in provider_exports:
+            for provider_binary in provider_binaries[:4]:
+                export_edges += 1
+                session.run(
+                    """
+                    MATCH (b:BINARY {path: $path})
+                    MERGE (s:SYMBOL:EXPORTED_SYMBOL {name: $symbol, binary_path: $path, package: $component})
+                    SET s.lang = "C"
+                    MERGE (b)-[:EXPORTS_SYMBOL]->(s)
+                    """,
+                    path=provider_binary,
+                    symbol=symbol,
+                    component=child_component,
+                )
+        for evidence in row.get("evidence") or []:
+            symbol = str(evidence.get("symbol") or "").strip()
+            src_binary = str(evidence.get("binary") or "").strip()
+            if not symbol or not src_binary:
+                continue
+            for provider_binary in provider_binaries[:4]:
+                session.run(
+                    """
+                    MATCH (src:SYMBOL:IMPORTED_SYMBOL {name: $symbol, binary_path: $src_binary, package: $src_component})
+                    MATCH (dst:SYMBOL:EXPORTED_SYMBOL {name: $symbol, binary_path: $dst_binary, package: $dst_component})
+                    MERGE (src)-[:RESOLVES_TO_EXPORT]->(dst)
+                    """,
+                    symbol=symbol,
+                    src_binary=src_binary,
+                    src_component=component,
+                    dst_binary=provider_binary,
+                    dst_component=child_component,
+                )
+    return {
+        "binaries": len(binaries),
+        "imports": import_edges,
+        "exports": export_edges,
+    }
+
+
+def resolve_external_c_calls_to_binary_symbols(session, parent_component, strict_resolution):
+    if not parent_component:
+        return 0
+    detail = dict(strict_resolution or {})
+    resolved_edges = 0
+    for row in list(detail.get("dependencies") or []):
+        child_component = str(row.get("component") or "").strip()
+        provider_binaries = list(row.get("provider_binaries") or [])
+        if not child_component or not provider_binaries:
+            continue
+        for evidence in row.get("evidence") or []:
+            symbol = str(evidence.get("symbol") or "").strip()
+            src_binary = str(evidence.get("binary") or "").strip()
+            if not symbol:
+                continue
+            for provider_binary in provider_binaries[:4]:
+                session.run(
+                    """
+                    MATCH (owner:METHOD:C)-[:AST*0..40]->(call:CALL:C)
+                    WHERE owner.package = $parent_component
+                      AND call.name = $symbol
+                    MATCH (dst:SYMBOL:EXPORTED_SYMBOL {name: $symbol, binary_path: $provider_binary, package: $child_component})
+                    MERGE (call)-[:RESOLVES_EXTERN_TO]->(dst)
+                    WITH DISTINCT owner, dst
+                    MATCH (p1:PACKAGE {name: owner.package})
+                    MATCH (p2:PACKAGE {name: dst.package})
+                    MERGE (p1)-[r:NATIVE_CALL]->(p2)
+                    SET r.derived = true,
+                        r.evidence_type = "binary-symbol-callsite",
+                        r.source = "native-symbol",
+                        r.last_symbol = $symbol,
+                        r.from_binary = $src_binary,
+                        r.to_binary = $provider_binary
+                    """,
+                    parent_component=parent_component,
+                    child_component=child_component,
+                    symbol=symbol,
+                    src_binary=src_binary,
+                    provider_binary=provider_binary,
+                )
+                resolved_edges += 1
+    return resolved_edges
+
+
 def generate_c_cpg_for_input(source_input, output_dir):
     script = os.path.join(REPO_ROOT, "generate_cpgs.sh")
     os.makedirs(output_dir, exist_ok=True)
@@ -462,50 +719,24 @@ def generate_c_cpg_for_input(source_input, output_dir):
     return cpg_json
 
 
-def maybe_import_native_source_for_symbol(
+def _import_native_component_source(
     session,
     *,
     vuln_rule,
-    symbol,
-    native_component_instances,
-    cache_root,
+    component,
+    resolved_version,
+    source_info,
     root_pkg,
     imported_cache,
-    allow_download=True,
+    cache_root,
+    symbol=None,
 ):
-    if ensure_native_source_tree is None or choose_c_analysis_scope is None or find_symbol_source_files is None:
-        return {"status": "unavailable", "reason": "native_source_resolver_import_failed"}
-
-    if not native_component_instances:
-        return {"status": "unavailable", "reason": "missing_component_instance"}
-
-    primary = dict(native_component_instances[0] or {})
-    component = str(primary.get("component") or vuln_rule.get("package") or "").strip()
-    resolved_version = str(primary.get("resolved_version") or "").strip()
-    matched_manifest_paths = []
-    for row in primary.get("matched_crates") or []:
-        matched_manifest_paths.extend(list(row.get("manifest_paths") or []))
-
-    source_info = ensure_native_source_tree(
-        component,
-        resolved_version,
-        matched_manifest_paths,
-        cache_root,
-        allow_download=allow_download,
-    )
-    if source_info.get("status") not in {"local", "downloaded"}:
-        return source_info
-
     source_root = source_info.get("source_root")
-    symbol_files = find_symbol_source_files(source_root, [symbol])
-    scope_input = choose_c_analysis_scope(source_root, symbol_files)
+    symbol_files = find_symbol_source_files(source_root, [symbol]) if symbol else []
+    scope_input = choose_c_analysis_scope(source_root, symbol_files) if symbol else source_root
     if not scope_input:
         scope_input = source_root
-    cache_key = (
-        component,
-        resolved_version,
-        os.path.abspath(scope_input),
-    )
+    cache_key = (component, resolved_version, os.path.abspath(scope_input))
     cached = imported_cache.get(cache_key)
     if cached:
         return cached
@@ -537,10 +768,24 @@ def maybe_import_native_source_for_symbol(
         source_root=source_root,
         provenance=source_info.get("provenance") or "downloaded-official",
     )
-    attach_symbols(session, [vuln_rule])
+    ensure_package_version_node(
+        session,
+        component,
+        lang="C",
+        version=resolved_version or None,
+        version_source=source_info.get("provenance") or "native-source",
+        extra_props={
+            "source_root": source_root,
+            "source_provenance": source_info.get("provenance") or "downloaded-official",
+        },
+    )
+    if component == str(vuln_rule.get("package") or "").strip():
+        attach_vulnerability_to_component(session, vuln_rule, component, resolved_version)
+        attach_symbols(session, [vuln_rule])
     link_c_calls_by_name(session)
     build_symbol_usage(session)
     build_pkg_call(session, root_pkg)
+    build_native_pkg_edges(session)
 
     result = {
         "status": "imported",
@@ -552,10 +797,275 @@ def maybe_import_native_source_for_symbol(
         "cpg_json": cpg_json,
         "provenance": source_info.get("provenance"),
         "download_url": source_info.get("download_url"),
+        "validation": source_info.get("validation"),
         "lower_id": lower_id,
         "upper_id": upper_id,
     }
     imported_cache[cache_key] = result
+    return result
+
+
+def _merge_native_dependency_candidates(strict_candidates, source_candidates):
+    merged = {}
+    for item in list(strict_candidates or []) + list(source_candidates or []):
+        component = str(item.get("component") or "").strip()
+        if not component:
+            continue
+        row = merged.setdefault(
+            component,
+            {
+                "component": component,
+                "confidence": item.get("confidence") or "medium",
+                "evidence_type": item.get("evidence_type") or "source-scan",
+                "source": item.get("source") or "native-source",
+                "evidence": [],
+            },
+        )
+        current_confidence = row.get("confidence") or "medium"
+        candidate_confidence = item.get("confidence") or "medium"
+        if current_confidence != "high" and candidate_confidence == "high":
+            row["confidence"] = candidate_confidence
+        if row.get("evidence_type") != "binary-symbol" and item.get("evidence_type") == "binary-symbol":
+            row["evidence_type"] = "binary-symbol"
+            row["source"] = item.get("source") or "native-symbol"
+        row["evidence"].extend(list(item.get("evidence") or []))
+    for row in merged.values():
+        row["evidence"] = row["evidence"][:12]
+    return sorted(merged.values(), key=lambda item: item["component"])
+
+
+def _collect_native_dependency_candidates(component, source_root, resolved_version=""):
+    strict_detail = {
+        "status": "unavailable",
+        "dependencies": [],
+        "component": component,
+        "resolved_version": resolved_version,
+    }
+    if resolve_strict_native_dependencies is not None:
+        try:
+            strict_detail = resolve_strict_native_dependencies(component, resolved_version=resolved_version)
+        except Exception as exc:
+            strict_detail = {
+                "status": "failed",
+                "component": component,
+                "resolved_version": resolved_version,
+                "reason": str(exc),
+                "dependencies": [],
+            }
+
+    source_candidates = []
+    if infer_native_source_dependencies is not None:
+        try:
+            source_candidates = list(infer_native_source_dependencies(component, source_root) or [])
+        except Exception as exc:
+            source_candidates = [{"component": "", "confidence": "low", "evidence": [{"path": "", "tokens": [f"dependency_scan_failed:{exc}"]}]}]
+
+    merged = _merge_native_dependency_candidates(
+        strict_detail.get("dependencies") or [],
+        source_candidates,
+    )
+    return {
+        "candidates": merged,
+        "strict_resolution": strict_detail,
+        "source_scan_dependencies": source_candidates,
+    }
+
+
+def _recursive_import_native_dependencies(
+    session,
+    *,
+    vuln_rule,
+    parent_component,
+    parent_resolved_version,
+    source_root,
+    cache_root,
+    root_pkg,
+    imported_cache,
+    recursion_depth,
+    max_depth,
+    max_components,
+    visited_components,
+):
+    if recursion_depth >= max_depth:
+        return {"status": "depth_limited", "imports": [], "missing": [], "discovered": []}
+    discovery = _collect_native_dependency_candidates(
+        parent_component,
+        source_root,
+        resolved_version=parent_resolved_version or "",
+    )
+    discovered = discovery.get("candidates", [])
+    imports = []
+    missing = []
+    budget = max(0, int(max_components))
+    for item in discovered[:budget]:
+        child_component = str(item.get("component") or "").strip()
+        if not child_component:
+            continue
+        create_native_depends_on(
+            session,
+            parent_component,
+            child_component,
+            evidence_type=item.get("evidence_type") or "source-scan",
+            confidence=item.get("confidence") or "medium",
+            source=item.get("source") or "native-source",
+            evidence=json.dumps(item.get("evidence") or [], ensure_ascii=False),
+        )
+        component_key = child_component.lower()
+        if component_key in visited_components:
+            imports.append(
+                {
+                    "status": "cached",
+                    "component": child_component,
+                    "resolved_version": "",
+                    "dependency_evidence": item.get("evidence") or [],
+                }
+            )
+            continue
+        visited_components.add(component_key)
+        child_probe = _probe_system_native_version(child_component)
+        child_version = str((child_probe or {}).get("version") or "").strip()
+        source_info = ensure_native_source_tree(
+            child_component,
+            child_version,
+            [],
+            cache_root,
+            allow_download=True,
+        )
+        if source_info.get("status") not in {"local", "downloaded"}:
+            missing.append(
+                {
+                    "component": child_component,
+                    "resolved_version": child_version,
+                    "reason": source_info.get("reason") or source_info.get("status"),
+                    "dependency_evidence": item.get("evidence") or [],
+                }
+            )
+            continue
+        child_import = _import_native_component_source(
+            session,
+            vuln_rule=vuln_rule,
+            component=child_component,
+            resolved_version=child_version,
+            source_info=source_info,
+            root_pkg=root_pkg,
+            imported_cache=imported_cache,
+            cache_root=cache_root,
+            symbol=None,
+        )
+        child_recursive = _recursive_import_native_dependencies(
+            session,
+            vuln_rule=vuln_rule,
+            parent_component=child_component,
+            parent_resolved_version=child_version,
+            source_root=source_info.get("source_root"),
+            cache_root=cache_root,
+            root_pkg=root_pkg,
+            imported_cache=imported_cache,
+            recursion_depth=recursion_depth + 1,
+            max_depth=max_depth,
+            max_components=max_components,
+            visited_components=visited_components,
+        )
+        child_import["dependency_evidence"] = item.get("evidence") or []
+        child_import["recursive"] = child_recursive
+        imports.append(child_import)
+    return {
+        "status": "expanded",
+        "imports": imports,
+        "missing": missing,
+        "discovered": discovered[:budget],
+        "strict_resolution": discovery.get("strict_resolution"),
+        "source_scan_dependencies": discovery.get("source_scan_dependencies", []),
+    }
+
+
+def maybe_import_native_source_for_symbol(
+    session,
+    *,
+    vuln_rule,
+    symbol,
+    native_component_instances,
+    cache_root,
+    root_pkg,
+    imported_cache,
+    allow_download=True,
+    max_dependency_depth=2,
+    max_dependency_components=6,
+):
+    if (
+        ensure_native_source_tree is None
+        or choose_c_analysis_scope is None
+        or find_symbol_source_files is None
+    ):
+        return {"status": "unavailable", "reason": "native_source_resolver_import_failed"}
+
+    if not native_component_instances:
+        return {"status": "unavailable", "reason": "missing_component_instance"}
+
+    primary = dict(native_component_instances[0] or {})
+    component = str(primary.get("component") or vuln_rule.get("package") or "").strip()
+    resolved_version = str(primary.get("resolved_version") or "").strip()
+    matched_manifest_paths = []
+    for row in primary.get("matched_crates") or []:
+        matched_manifest_paths.extend(list(row.get("manifest_paths") or []))
+
+    source_info = ensure_native_source_tree(
+        component,
+        resolved_version,
+        matched_manifest_paths,
+        cache_root,
+        allow_download=allow_download,
+    )
+    if source_info.get("status") not in {"local", "downloaded"}:
+        return source_info
+
+    result = _import_native_component_source(
+        session,
+        vuln_rule=vuln_rule,
+        component=component,
+        resolved_version=resolved_version,
+        source_info=source_info,
+        root_pkg=root_pkg,
+        imported_cache=imported_cache,
+        cache_root=cache_root,
+        symbol=symbol,
+    )
+    recursive = _recursive_import_native_dependencies(
+        session,
+        vuln_rule=vuln_rule,
+        parent_component=component,
+        parent_resolved_version=resolved_version,
+        source_root=source_info.get("source_root"),
+        cache_root=cache_root,
+        root_pkg=root_pkg,
+        imported_cache=imported_cache,
+        recursion_depth=0,
+        max_depth=max_dependency_depth,
+        max_components=max_dependency_components,
+        visited_components={component.lower()},
+    )
+    result["dependency_imports"] = recursive.get("imports", [])
+    result["missing_dependencies"] = recursive.get("missing", [])
+    result["discovered_dependencies"] = recursive.get("discovered", [])
+    result["strict_dependency_resolution"] = recursive.get("strict_resolution", {})
+    result["source_scan_dependencies"] = recursive.get("source_scan_dependencies", [])
+    result["binary_symbol_inventory"] = register_binary_symbol_inventory(
+        session,
+        component,
+        result["strict_dependency_resolution"],
+    )
+    result["strict_callsite_edges"] = resolve_external_c_calls_to_binary_symbols(
+        session,
+        component,
+        result["strict_dependency_resolution"],
+    )
+    result["native_analysis_coverage"] = (
+        "target_plus_key_subdeps"
+        if result["dependency_imports"] and not result["missing_dependencies"]
+        else ("target_only" if result["status"] == "imported" else "none")
+    )
+    if result["missing_dependencies"]:
+        result["native_analysis_coverage"] = "target_only_incomplete"
     return result
 
 
@@ -1424,13 +1934,15 @@ def _normalize_sink_candidate_specs(sink_names):
     def add_spec(item):
         is_mapping = isinstance(item, dict)
         if isinstance(item, dict):
+            name_regex = str(item.get("name_regex") or "").strip()
             raw = str(item.get("path") or item.get("name") or item.get("raw") or item.get("token") or "").strip()
-            if not raw:
+            if not raw and not name_regex:
                 return
             contains = [str(tok).strip().lower() for tok in _ensure_list(item.get("contains") or item.get("code_contains")) if str(tok).strip()]
             contains_all = bool(item.get("contains_all", True))
             context_tokens = [str(tok).strip().lower() for tok in _ensure_list(item.get("context_tokens")) if str(tok).strip()]
         else:
+            name_regex = ""
             raw = str(item or "").strip()
             if not raw:
                 return
@@ -1438,8 +1950,8 @@ def _normalize_sink_candidate_specs(sink_names):
             contains_all = True
             context_tokens = []
 
-        token = _coerce_call_name(raw)
-        if not token:
+        token = _coerce_call_name(raw) if raw else ""
+        if not token and not name_regex:
             return
 
         if is_mapping and not context_tokens and ("::" in raw or "." in raw):
@@ -1449,14 +1961,16 @@ def _normalize_sink_candidate_specs(sink_names):
                     context_tokens.append(lowered)
 
         spec = {
-            "raw": raw,
+            "raw": raw or name_regex,
             "token": token,
+            "name_regex": name_regex,
             "contains": contains,
             "contains_all": contains_all,
             "context_tokens": context_tokens,
         }
         key = (
             spec["raw"].lower(),
+            spec["name_regex"],
             tuple(spec["contains"]),
             spec["contains_all"],
             tuple(spec["context_tokens"]),
@@ -1541,10 +2055,11 @@ def collect_rust_sink_candidates(vuln_rule):
             for atom in _iter_condition_atoms(cond):
                 ctype = str(atom.get("type") or "").strip()
                 if ctype in {"call", "call_code_contains", "field_to_call_arg", "io_to_call_arg", "option_to_call_arg", "len_to_call_arg", "builder_flag_chain"}:
-                    if atom.get("name") or atom.get("names"):
+                    if atom.get("name") or atom.get("names") or atom.get("name_regex"):
                         candidates.append(
                             {
                                 "name": atom.get("name") or atom.get("names"),
+                                "name_regex": atom.get("name_regex"),
                                 "contains": atom.get("contains") or atom.get("code_contains"),
                                 "contains_all": atom.get("contains_all", True),
                             }
@@ -2059,7 +2574,7 @@ def clear_supplychain(session):
     """, rel_types=SUPPLYCHAIN_REL_TYPES)
     session.run("""
         MATCH (n)
-        WHERE n:PACKAGE OR n:VERSION OR n:VULNERABILITY OR n:SYMBOL
+        WHERE n:PACKAGE OR n:VERSION OR n:VULNERABILITY OR n:SYMBOL OR n:BINARY OR n:EXPORTED_SYMBOL OR n:IMPORTED_SYMBOL
         DETACH DELETE n
     """)
 
@@ -2120,7 +2635,9 @@ def import_vulns(session, vulns, deps):
             if version_in_range(ver, vrange):
                 matched = True
                 session.run("""
-                    MATCH (p:PACKAGE {name: $pkg})
+                    MERGE (p:PACKAGE {name: $pkg})
+                    SET p.lang = coalesce(p.lang, "C")
+                    WITH p
                     MATCH (ver:VERSION {semver: $ver})
                     MATCH (v:VULNERABILITY {cve: $cve})
                     MERGE (p)-[:HAS_VERSION]->(ver)
@@ -2130,7 +2647,9 @@ def import_vulns(session, vulns, deps):
         if not matched:
             # Fallback: attach to package if no version info
             session.run("""
-                MATCH (p:PACKAGE {name: $pkg})
+                MERGE (p:PACKAGE {name: $pkg})
+                SET p.lang = coalesce(p.lang, "C")
+                WITH p
                 MATCH (v:VULNERABILITY {cve: $cve})
                 MERGE (p)-[:EXPOSES_VULN]->(v)
             """, pkg=pkg_name, cve=cve)
@@ -2144,7 +2663,8 @@ def attach_symbols(session, vulns):
                 MERGE (s:SYMBOL {name: $sym, lang: "C"})
                 SET s.source_status = coalesce($status, s.source_status)
                 WITH s
-                MATCH (p:PACKAGE {name: $pkg})
+                MERGE (p:PACKAGE {name: $pkg})
+                SET p.lang = coalesce(p.lang, "C")
                 MERGE (p)-[:PROVIDES_SYMBOL]->(s)
             """, sym=sym, pkg=pkg_name, status=source_status)
 
@@ -2214,7 +2734,7 @@ def build_pkg_call(session, root_pkg):
 
 def find_dep_chain(session, root, pkg):
     res = session.run("""
-        MATCH p=(root:PACKAGE {name: $root})-[:DEPENDS_ON*0..]->(pkg:PACKAGE {name: $pkg})
+        MATCH p=(root:PACKAGE {name: $root})-[:DEPENDS_ON|NATIVE_DEPENDS_ON*0..]->(pkg:PACKAGE {name: $pkg})
         RETURN [n IN nodes(p) | n.name] AS chain
         LIMIT 1
     """, root=root, pkg=pkg).single()
@@ -2222,10 +2742,11 @@ def find_dep_chain(session, root, pkg):
 
 def find_dep_chain_evidence(session, root, pkg):
     res = session.run("""
-        MATCH p=(root:PACKAGE {name: $root})-[:DEPENDS_ON*0..]->(pkg:PACKAGE {name: $pkg})
+        MATCH p=(root:PACKAGE {name: $root})-[:DEPENDS_ON|NATIVE_DEPENDS_ON*0..]->(pkg:PACKAGE {name: $pkg})
         RETURN [rel IN relationships(p) | {
             from: startNode(rel).name,
             to: endNode(rel).name,
+            type: type(rel),
             evidence_type: rel.evidence_type,
             confidence: rel.confidence,
             source: rel.source,
@@ -2568,15 +3089,42 @@ def collect_evidence_calls(session, chain_nodes):
         "all_calls": all_calls
     }
 
+def _find_sink_match_in_text(text, token="", name_regex=""):
+    if not text:
+        return None
+    if token:
+        try:
+            return re.search(rf"\b{re.escape(token)}\s*\(", text)
+        except re.error:
+            return None
+    if not name_regex:
+        return None
+    try:
+        call_matches = re.finditer(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", text)
+    except re.error:
+        return None
+    for match in call_matches:
+        call_name = match.group(1)
+        try:
+            if re.search(name_regex, call_name or "") is not None:
+                return match
+        except re.error:
+            return None
+    return None
+
+
 def _extract_code_snippet_for_sink(code, sink_name, width=120):
     text = str(code or "")
-    token = _coerce_call_name(sink_name)
-    if not text or not token:
+    token = ""
+    name_regex = ""
+    if isinstance(sink_name, dict):
+        token = _coerce_call_name(sink_name.get("token") or sink_name.get("raw"))
+        name_regex = str(sink_name.get("name_regex") or "").strip()
+    else:
+        token = _coerce_call_name(sink_name)
+    if not text or (not token and not name_regex):
         return text
-    try:
-        match = re.search(rf"\b{re.escape(token)}\s*\(", text)
-    except re.error:
-        match = None
+    match = _find_sink_match_in_text(text, token=token, name_regex=name_regex)
     if not match:
         return text
     start = max(0, match.start() - width)
@@ -2585,7 +3133,11 @@ def _extract_code_snippet_for_sink(code, sink_name, width=120):
 
 
 def synthesize_sink_calls_from_method_code(chain_nodes, sink_names):
-    specs = [spec for spec in _normalize_sink_candidate_specs(sink_names) if len(spec.get("token") or "") >= 3]
+    specs = [
+        spec
+        for spec in _normalize_sink_candidate_specs(sink_names)
+        if len(spec.get("token") or "") >= 3 or spec.get("name_regex")
+    ]
     if not specs:
         return []
 
@@ -2602,24 +3154,22 @@ def synthesize_sink_calls_from_method_code(chain_nodes, sink_names):
         method_id = node.get("id")
         for spec in specs:
             token = spec.get("token")
-            try:
-                hit = re.search(rf"\b{re.escape(token)}\s*\(", method_code)
-            except re.error:
-                hit = None
+            hit = _find_sink_match_in_text(method_code, token=token, name_regex=spec.get("name_regex"))
             if not hit:
                 continue
-            snippet = _extract_code_snippet_for_sink(method_code, token)
+            snippet = _extract_code_snippet_for_sink(method_code, spec)
             if not _sink_spec_matches_text(spec, snippet or method_code):
                 continue
-            key = (method_id, token.lower())
+            key_token = (token or spec.get("name_regex") or "").lower()
+            key = (method_id, key_token)
             if key in synthetic_seen:
                 continue
             synthetic_seen.add(key)
             synthetic.append(
                 {
-                    "id": f"synthetic:{method_id}:{token}",
-                    "name": token,
-                    "code": _extract_code_snippet_for_sink(method_code, token),
+                    "id": f"synthetic:{method_id}:{key_token}",
+                    "name": token or spec.get("raw"),
+                    "code": _extract_code_snippet_for_sink(method_code, spec),
                     "lang": "Rust",
                     "method": method_name,
                     "scope": "synthetic_method_code",
@@ -2629,7 +3179,11 @@ def synthesize_sink_calls_from_method_code(chain_nodes, sink_names):
 
 
 def collect_package_synthetic_sink_calls(session, root_pkg, sink_names, max_methods=800):
-    specs = [spec for spec in _normalize_sink_candidate_specs(sink_names) if len(spec.get("token") or "") >= 3]
+    specs = [
+        spec
+        for spec in _normalize_sink_candidate_specs(sink_names)
+        if len(spec.get("token") or "") >= 3 or spec.get("name_regex")
+    ]
     if not specs:
         return []
 
@@ -2653,24 +3207,22 @@ def collect_package_synthetic_sink_calls(session, root_pkg, sink_names, max_meth
             continue
         for spec in specs:
             token = spec.get("token")
-            try:
-                hit = re.search(rf"\b{re.escape(token)}\s*\(", method_code)
-            except re.error:
-                hit = None
+            hit = _find_sink_match_in_text(method_code, token=token, name_regex=spec.get("name_regex"))
             if not hit:
                 continue
-            snippet = _extract_code_snippet_for_sink(method_code, token)
+            snippet = _extract_code_snippet_for_sink(method_code, spec)
             if not _sink_spec_matches_text(spec, snippet or method_code):
                 continue
-            key = (method_id, token.lower())
+            key_token = (token or spec.get("name_regex") or "").lower()
+            key = (method_id, key_token)
             if key in synthetic_seen:
                 continue
             synthetic_seen.add(key)
             synthetic.append(
                 {
-                    "id": f"pkgsynthetic:{method_id}:{token}",
-                    "name": token,
-                    "code": _extract_code_snippet_for_sink(method_code, token),
+                    "id": f"pkgsynthetic:{method_id}:{key_token}",
+                    "name": token or spec.get("raw"),
+                    "code": _extract_code_snippet_for_sink(method_code, spec),
                     "lang": "Rust",
                     "method": method_name,
                     "scope": "synthetic_package_method_code",
@@ -2683,7 +3235,11 @@ def collect_source_synthetic_sink_calls(project_dir, sink_names, max_files=4000,
     root = str(project_dir or "").strip()
     if not root or not os.path.isdir(root):
         return []
-    specs = [spec for spec in _normalize_sink_candidate_specs(sink_names) if len(spec.get("token") or "") >= 3]
+    specs = [
+        spec
+        for spec in _normalize_sink_candidate_specs(sink_names)
+        if len(spec.get("token") or "") >= 3 or spec.get("name_regex")
+    ]
     if not specs:
         return []
 
@@ -2711,11 +3267,26 @@ def collect_source_synthetic_sink_calls(project_dir, sink_names, max_files=4000,
                 token = spec.get("token")
                 if len(synthetic) >= max_hits:
                     break
-                try:
-                    pattern = re.compile(rf"\b{re.escape(token)}\s*\(")
-                except re.error:
-                    continue
-                for match in pattern.finditer(content):
+                if token:
+                    try:
+                        matches = re.finditer(rf"\b{re.escape(token)}\s*\(", content)
+                    except re.error:
+                        continue
+                else:
+                    try:
+                        all_calls = re.finditer(r"\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(", content)
+                    except re.error:
+                        continue
+                    matches = []
+                    for call_match in all_calls:
+                        call_name = call_match.group(1)
+                        try:
+                            if re.search(spec.get("name_regex"), call_name or "") is not None:
+                                matches.append(call_match)
+                        except re.error:
+                            matches = []
+                            break
+                for match in matches:
                     if len(synthetic) >= max_hits:
                         break
                     line_no = content.count("\n", 0, match.start()) + 1
@@ -2724,7 +3295,8 @@ def collect_source_synthetic_sink_calls(project_dir, sink_names, max_files=4000,
                     if line_end < 0:
                         line_end = len(content)
                     line_text = content[line_start:line_end].strip()
-                    key = (relpath, token.lower(), line_no)
+                    key_token = (token or spec.get("name_regex") or "").lower()
+                    key = (relpath, key_token, line_no)
                     if key in synthetic_seen:
                         continue
                     if not _sink_spec_matches_text(spec, line_text):
@@ -2732,8 +3304,8 @@ def collect_source_synthetic_sink_calls(project_dir, sink_names, max_files=4000,
                     synthetic_seen.add(key)
                     synthetic.append(
                         {
-                            "id": f"srcsynthetic:{relpath}:{line_no}:{token}",
-                            "name": token,
+                            "id": f"srcsynthetic:{relpath}:{line_no}:{key_token}",
+                            "name": token or spec.get("raw"),
                             "code": line_text,
                             "lang": "Rust",
                             "method": f"{relpath}:{line_no}",
@@ -4629,6 +5201,7 @@ def main():
             link_c_calls_by_name(session)
             build_symbol_usage(session)
             build_pkg_call(session, root_pkg)
+            build_native_pkg_edges(session)
 
             for v in vulns:
                 pkg = v["package"]
@@ -4951,11 +5524,31 @@ def main():
                                 solver=path_solver,
                             )
 
+                    native_missing_components = list((native_source_import or {}).get("missing_dependencies") or [])
+                    native_dependency_imports = list((native_source_import or {}).get("dependency_imports") or [])
+                    strict_dependency_resolution = dict((native_source_import or {}).get("strict_dependency_resolution") or {})
+                    strict_callsite_edges = int((native_source_import or {}).get("strict_callsite_edges") or 0)
+                    native_analysis_coverage = str(
+                        (native_source_import or {}).get("native_analysis_coverage")
+                        or ("target_only" if (native_source_import or {}).get("status") == "imported" else "none")
+                    )
+                    if strict_callsite_edges > 0 and not native_missing_components:
+                        native_analysis_coverage = "callsite_level"
+                    elif strict_dependency_resolution.get("dependencies") and not native_missing_components:
+                        native_analysis_coverage = "symbol_level"
+
                     preserve_binary_decision = has_actionable_trigger_hits(trigger_hits)
-                    if source_status in ["stub", "binary-only"]:
+                    wrapper_sink_evidence = bool(
+                        synthetic_sink_calls or package_synthetic_sink_calls or source_synthetic_sink_calls
+                    )
+                    wrapper_input_satisfied = input_predicate_eval.get("status") == "satisfied"
+                    if source_status in ["stub", "binary-only", "system"]:
                         if reachable and preserve_binary_decision:
                             triggerable = trig["triggerable"]
                             downgrade_reason = f"source_status={source_status};preserved_by_rust_trigger_evidence"
+                        elif reachable and wrapper_sink_evidence and wrapper_input_satisfied:
+                            triggerable = "possible"
+                            downgrade_reason = f"source_status={source_status};preserved_by_wrapper_sink_evidence"
                         else:
                             triggerable = "unknown" if reachable else "unreachable"
                             downgrade_reason = f"source_status={source_status}"
@@ -5002,6 +5595,32 @@ def main():
                             trig["evidence_notes"].append("Existential input model satisfied using attacker-controlled length assumptions.")
                         else:
                             trig["evidence_notes"].append("Existential input model satisfied using observed code lengths.")
+
+                    if reachable and native_analysis_coverage in {"none", "target_only_incomplete"}:
+                        if triggerable == "confirmed":
+                            triggerable = "possible"
+                        downgrade_reason = _append_reason(downgrade_reason, "native_dependency_graph_incomplete")
+                        if native_missing_components:
+                            trig["evidence_notes"].append(
+                                "Native dependency graph is incomplete; missing source for: "
+                                + ", ".join(sorted({str(item.get("component") or "") for item in native_missing_components if item.get("component")}))
+                            )
+                        else:
+                            trig["evidence_notes"].append(
+                                "Native dependency graph is incomplete; result preserved using partial native source coverage."
+                            )
+
+                    if (
+                        reachable
+                        and source_status in ["stub", "binary-only", "system"]
+                        and triggerable == "confirmed"
+                        and strict_callsite_edges <= 0
+                    ):
+                        triggerable = "possible"
+                        downgrade_reason = _append_reason(downgrade_reason, "no_callsite_level_native_resolution")
+                        trig["evidence_notes"].append(
+                            "Strict native resolution did not reach callsite level; downgraded from confirmed to possible."
+                        )
 
                     if path_solver_enabled:
                         constraint_result["path_solver"] = {
@@ -5087,6 +5706,12 @@ def main():
                         "prune_not_triggered": prune_not_triggered,
                         "native_component_instances": native_component_instances,
                         "native_source_import": native_source_import,
+                        "strict_dependency_resolution": strict_dependency_resolution,
+                        "binary_symbol_inventory": (native_source_import or {}).get("binary_symbol_inventory"),
+                        "strict_callsite_edges": (native_source_import or {}).get("strict_callsite_edges"),
+                        "native_analysis_coverage": native_analysis_coverage,
+                        "native_dependency_imports": native_dependency_imports,
+                        "native_missing_components": native_missing_components,
                         "evidence_notes": trig["evidence_notes"],
                         "source_status": source_status,
                         "downgrade_reason": downgrade_reason,

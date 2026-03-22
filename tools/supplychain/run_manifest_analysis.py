@@ -37,13 +37,25 @@ from typing import Any
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent.parent
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "output" / "vulnerability_runs"
-DEFAULT_VUL_ROOT = Path(os.environ.get("SUPPLYCHAIN_VUL_ROOT", "/Users/dingyanwen/Desktop/VUL")).resolve()
 
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from archive_analysis_run import archive_run
-from auto_vuln_inputs import can_auto_generate, generate_extras_payload, generate_vulns_payload
+from auto_vuln_inputs import (
+    FAMILY_COMPONENTS,
+    can_auto_generate,
+    generate_extras_payload,
+    generate_vulns_payload,
+)
+from tools.common.path_defaults import infer_vul_root
+from vuln_db import default_runtime_rules_path
+from select_vuln_rules import write_selected_rules_for_project
+
+
+DEFAULT_VUL_ROOT = infer_vul_root(REPO_ROOT)
 
 
 def load_json(path: Path) -> Any:
@@ -56,6 +68,36 @@ def write_json(path: Path, data: Any) -> None:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def _name_variants(text: Any) -> set[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    variants = {
+        raw,
+        raw.lower(),
+        raw.replace("-", "_"),
+        raw.replace("_", "-"),
+    }
+    lowered = raw.lower()
+    if lowered.startswith("lib") and len(lowered) > 3:
+        variants.add(lowered[3:])
+    suffixes = ("-sys2", "_sys2", "-sys", "_sys", "-rs", "_rs")
+    work = set(variants)
+    for variant in list(work):
+        lowered_variant = variant.lower()
+        for suffix in suffixes:
+            if lowered_variant.endswith(suffix) and len(lowered_variant) > len(suffix):
+                stripped = lowered_variant[: -len(suffix)]
+                variants.add(stripped)
+                variants.add(stripped.replace("-", "_"))
+                variants.add(stripped.replace("_", "-"))
+    return {variant for variant in variants if variant}
+
+
+def _expand_manifest_path(value: Any) -> str:
+    return os.path.expandvars(os.path.expanduser(str(value or "").strip()))
 
 
 def infer_project_and_version(project_dir: Path) -> tuple[str, str]:
@@ -78,9 +120,10 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("manifest item missing project_dir")
     if "cve_dir" not in item:
         raise ValueError("manifest item missing cve_dir")
-    if "vulns" not in item and not item.get("skip_reason") and not can_auto_generate(item):
+    default_db_rules = default_runtime_rules_path()
+    if "vulns" not in item and not item.get("skip_reason") and not can_auto_generate(item) and not default_db_rules.exists():
         raise ValueError("manifest item missing vulns")
-    project_dir = Path(item["project_dir"]).resolve()
+    project_dir = Path(_expand_manifest_path(item["project_dir"])).resolve()
     project, version = infer_project_and_version(project_dir)
     rel = item.get("rel")
     if not rel:
@@ -90,6 +133,13 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
             rel = str(project_dir)
     normalized = dict(item)
     normalized["project_dir"] = str(project_dir)
+    if item.get("vulns"):
+        normalized["vulns"] = _expand_manifest_path(item["vulns"])
+    if item.get("extras"):
+        normalized["extras"] = _expand_manifest_path(item["extras"])
+    cpg_input_value = item.get("cpg_input") or item.get("input_file")
+    if cpg_input_value:
+        normalized["cpg_input"] = _expand_manifest_path(cpg_input_value)
     normalized["project"] = item.get("project") or project
     normalized["version"] = item.get("version") or version
     normalized["rel"] = rel
@@ -106,6 +156,54 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def expected_component_aliases(item: dict[str, Any]) -> set[str]:
+    aliases = set()
+    family = str(item.get("family") or "").strip().lower()
+    component = item.get("component")
+    cve_dir = str(item.get("cve_dir") or "").strip()
+    if component:
+        aliases.update(_name_variants(component))
+    if family:
+        aliases.update(_name_variants(family))
+        aliases.update(_name_variants(FAMILY_COMPONENTS.get(family, "")))
+    if "__" in cve_dir:
+        aliases.update(_name_variants(cve_dir.split("__", 1)[1]))
+    return aliases
+
+
+def vuln_rule_targets_expected_component(rule: dict[str, Any], expected_aliases: set[str]) -> bool:
+    if not expected_aliases:
+        return True
+    candidates = set()
+    candidates.update(_name_variants(rule.get("package")))
+    for crate in (rule.get("match") or {}).get("crates") or []:
+        candidates.update(_name_variants(crate))
+    return bool(candidates & expected_aliases)
+
+
+def primary_vuln_for_item(report_path: Path, item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if not report_path.exists():
+        return None, None
+    report = load_json(report_path)
+    vulns = report.get("vulnerabilities") or []
+    if not vulns:
+        return None, None
+    expected_aliases = expected_component_aliases(item)
+    if not expected_aliases:
+        return vulns[0], None
+    for vuln in vulns:
+        package_aliases = _name_variants(vuln.get("package"))
+        if package_aliases & expected_aliases:
+            return vuln, None
+    package_names = [str(v.get("package") or "") for v in vulns[:5]]
+    expected_label = "/".join(sorted(expected_aliases))
+    mismatch = (
+        f"error: report component mismatch for {item['cve_dir']}; "
+        f"expected one of [{expected_label}] but primary report components were {package_names}"
+    )
+    return vulns[0], mismatch
+
+
 def copy_or_generate_input_json(
     src: Path | None,
     dest: Path,
@@ -119,6 +217,44 @@ def copy_or_generate_input_json(
         write_json(dest, generator())
     else:
         write_json(dest, default_payload)
+
+
+def prepare_vulns_input(item: dict[str, Any], case_dir: Path) -> tuple[Path | None, str | None]:
+    vulns_path = case_dir / "analysis_inputs" / "vulns.json"
+    explicit_vulns = Path(item["vulns"]).resolve() if item.get("vulns") else None
+    expected_aliases = expected_component_aliases(item)
+
+    if explicit_vulns:
+        copy_or_generate_input_json(explicit_vulns, vulns_path, [])
+    elif can_auto_generate(item):
+        write_json(vulns_path, generate_vulns_payload(item))
+    else:
+        default_db_rules = default_runtime_rules_path()
+        if not default_db_rules.exists():
+            return None, "error: no runtime vulnerability database is available for rule selection"
+        try:
+            summary = write_selected_rules_for_project(
+                Path(item["project_dir"]).resolve(),
+                vulns_path,
+                runtime_rules_path=default_db_rules.resolve(),
+                curated_only=False,
+                fallback_to_full_db=False,
+                cargo_features=item.get("cargo_features") or "",
+                cargo_all_features=bool(item.get("cargo_all_features")),
+                cargo_no_default_features=bool(item.get("cargo_no_default_features")),
+            )
+        except Exception as exc:
+            return None, f"error: project rule selection failed: {exc}"
+        if int(summary.get("selected_rules") or 0) <= 0:
+            expected_label = "/".join(sorted(expected_aliases)) if expected_aliases else "unknown_target"
+            return None, f"error: no project-specific vulnerability rules matched expected component(s) [{expected_label}]"
+
+    rules = load_json(vulns_path)
+    if expected_aliases and rules:
+        if not any(vuln_rule_targets_expected_component(rule, expected_aliases) for rule in rules):
+            expected_label = "/".join(sorted(expected_aliases))
+            return None, f"error: prepared rules do not cover expected component(s) [{expected_label}]"
+    return vulns_path, None
 
 
 def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_source_supplement: bool = False) -> list[str]:
@@ -153,7 +289,7 @@ def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_so
     return cmd
 
 
-def extract_summary_fields(report_path: Path) -> dict[str, Any]:
+def extract_summary_fields(report_path: Path, item: dict[str, Any] | None = None) -> dict[str, Any]:
     if not report_path.exists():
         return {
             "reachable": False,
@@ -163,10 +299,10 @@ def extract_summary_fields(report_path: Path) -> dict[str, Any]:
             "symbol": None,
             "component": None,
             "status": "analysis_failed",
+            "validation_error": None,
         }
-    report = load_json(report_path)
-    vulns = report.get("vulnerabilities") or []
-    if not vulns:
+    vuln, validation_error = primary_vuln_for_item(report_path, item or {})
+    if not vuln:
         return {
             "reachable": False,
             "triggerable": None,
@@ -175,12 +311,16 @@ def extract_summary_fields(report_path: Path) -> dict[str, Any]:
             "symbol": None,
             "component": None,
             "status": "analysis_failed",
+            "validation_error": validation_error,
         }
-    vuln = vulns[0]
     reachable = bool(vuln.get("reachable"))
     triggerable = vuln.get("triggerable")
     status = "analysis_failed"
-    if triggerable == "confirmed":
+    if validation_error:
+        status = "analysis_failed"
+        reachable = False
+        triggerable = None
+    elif triggerable == "confirmed":
         status = "triggerable_confirmed"
     elif triggerable == "possible":
         status = "triggerable_possible"
@@ -198,6 +338,7 @@ def extract_summary_fields(report_path: Path) -> dict[str, Any]:
         "symbol": vuln.get("symbol"),
         "component": vuln.get("package"),
         "status": status,
+        "validation_error": validation_error,
     }
 
 
@@ -239,13 +380,7 @@ def run_one(
             "component": item.get("component"),
         }
 
-    vulns_src = Path(item["vulns"]).resolve() if item.get("vulns") else None
-    copy_or_generate_input_json(
-        vulns_src,
-        case_dir / "analysis_inputs" / "vulns.json",
-        [],
-        generator=(lambda: generate_vulns_payload(item)) if not vulns_src else None,
-    )
+    _, vulns_error = prepare_vulns_input(item, case_dir)
     extras_src = Path(item["extras"]).resolve() if item.get("extras") else None
     copy_or_generate_input_json(
         extras_src,
@@ -253,6 +388,28 @@ def run_one(
         {"packages": [], "depends": []},
         generator=(lambda: generate_extras_payload(item)) if not extras_src and can_auto_generate(item) else None,
     )
+    if vulns_error:
+        log_path = case_dir / "run.log"
+        log_path.write_text(f"{vulns_error}\n", encoding="utf-8")
+        return {
+            "rel": item["rel"],
+            "project": item["project"],
+            "version": item["version"],
+            "project_dir": item["project_dir"],
+            "run_dir": str(case_dir),
+            "report": str(case_dir / "analysis_report.json"),
+            "log": str(log_path),
+            "exit_code": 1,
+            "seconds": 0.0,
+            "status": "analysis_failed",
+            "reachable": False,
+            "triggerable": None,
+            "result_kind": None,
+            "resolved_version": None,
+            "symbol": None,
+            "cve_dir": item["cve_dir"],
+            "component": item.get("component"),
+        }
 
     cmd = build_command(
         item,
@@ -283,14 +440,18 @@ def run_one(
     seconds = round(time.time() - start, 2)
 
     log_path = case_dir / "run.log"
-    log_path.write_text(
-        f"$ {' '.join(cmd)}\n\n[stdout]\n{stdout}\n\n[stderr]\n{stderr}\n",
-        encoding="utf-8",
-    )
-
-    summary = extract_summary_fields(case_dir / "analysis_report.json")
+    summary = extract_summary_fields(case_dir / "analysis_report.json", item)
+    validation_error = summary.get("validation_error")
+    if validation_error:
+        stderr = f"{stderr.rstrip()}\n{validation_error}\n".lstrip("\n")
+    log_path.write_text(f"$ {' '.join(cmd)}\n\n[stdout]\n{stdout}\n\n[stderr]\n{stderr}\n", encoding="utf-8")
     if timed_out:
         summary["status"] = "analysis_timeout"
+        summary["reachable"] = False
+        summary["triggerable"] = None
+        summary["result_kind"] = None
+    elif validation_error:
+        summary["status"] = "analysis_failed"
         summary["reachable"] = False
         summary["triggerable"] = None
         summary["result_kind"] = None

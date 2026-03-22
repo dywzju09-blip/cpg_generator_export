@@ -5,12 +5,19 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tarfile
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_VUL_ROOT = Path("/Users/dingyanwen/Desktop/VUL")
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.common.path_defaults import infer_vul_root
+
+
+DEFAULT_VUL_ROOT = infer_vul_root(REPO_ROOT)
 
 TOOL_ITEMS = [
     "README.md",

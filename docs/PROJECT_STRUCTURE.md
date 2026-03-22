@@ -7,6 +7,7 @@
 ```text
 /Users/dingyanwen/Desktop/RUST_IR/cpg_generator_export
 ├── README.md
+├── Data/
 ├── generate_cpgs.sh
 ├── PROJECT_RULES.md
 ├── c_tools/
@@ -29,6 +30,7 @@
 ## 目录职责
 
 - `c_tools/`: C 侧辅助工具。
+- `Data/`: 默认 Rust-native 组件漏洞数据库。
 - `rust_src/`: Rust CPG 生成器源码。
 - `tools/fetch`: native 组件源码或二进制获取脚本。
 - `tools/neo4j`: 图导入、链接和查询相关工具。

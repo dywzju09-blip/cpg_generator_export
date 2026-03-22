@@ -1,8 +1,8 @@
 [
   {
     "id": "git-stack-0.10.17",
-    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream",
-    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream/src/bin/git-stack/main.rs",
+    "project_dir": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream",
+    "input_file": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/git-stack-0.10.17/upstream/src/bin/git-stack/main.rs",
     "root": "git-stack",
     "root_method": "main",
     "extras": "tools/supplychain/real_apps/extras/git_stack_extras.json",
@@ -10,8 +10,8 @@
   },
   {
     "id": "cocogitto-5.2.0",
-    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream",
-    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream/src/bin/cog.rs",
+    "project_dir": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream",
+    "input_file": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/cocogitto-5.2.0/upstream/src/bin/cog.rs",
     "root": "cocogitto",
     "root_method": "main",
     "extras": "tools/supplychain/real_apps/extras/cocogitto_extras.json",
@@ -19,8 +19,8 @@
   },
   {
     "id": "git-cliff-1.1.2",
-    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream",
-    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream/src/lib.rs",
+    "project_dir": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream",
+    "input_file": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2024-24577__libgit2/git-cliff-1.1.2/upstream/src/lib.rs",
     "root": "git-cliff",
     "root_method": "run",
     "extras": "tools/supplychain/real_apps/extras/git_cliff_extras.json",
@@ -28,8 +28,8 @@
   },
   {
     "id": "post_maker-0.6.3",
-    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream",
-    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream/src/main.rs",
+    "project_dir": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream",
+    "input_file": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2023-4863__libwebp/post_maker-0.6.3/upstream/src/main.rs",
     "root": "post_maker",
     "root_method": "main",
     "extras": "tools/supplychain/real_apps/extras/post_maker_extras.json",
@@ -37,8 +37,8 @@
   },
   {
     "id": "nu_plugin_to_sqlite-0.44.0",
-    "project_dir": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream",
-    "input_file": "/Users/dingyanwen/Desktop/VUL/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream/src/main.rs",
+    "project_dir": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream",
+    "input_file": "$SUPPLYCHAIN_VUL_ROOT/cases/real-apps/CVE-2022-35737__sqlite/nu_plugin_to_sqlite-0.44.0/upstream/src/main.rs",
     "root": "nu_plugin_to_sqlite",
     "root_method": "main",
     "extras": "tools/supplychain/real_apps/extras/nu_sqlite_extras.json",

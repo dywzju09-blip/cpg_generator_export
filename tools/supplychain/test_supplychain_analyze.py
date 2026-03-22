@@ -1,7 +1,7 @@
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tools.supplychain.supplychain_analyze import (
     analyze_triggerability,
@@ -18,7 +18,9 @@ from tools.supplychain.supplychain_analyze import (
     map_result_kind,
     merge_evidence_calls,
     normalize_vuln_rule,
+    register_binary_symbol_inventory,
     resolve_native_component_instances,
+    resolve_external_c_calls_to_binary_symbols,
     synthesize_sink_calls_from_method_code,
     summarize_guard_status,
 )
@@ -27,6 +29,15 @@ from tools.fetch.native_source_resolver import (
     ensure_native_source_tree,
     find_local_native_source_tree,
     find_symbol_source_files,
+    infer_native_source_dependencies,
+)
+from tools.fetch.native_source_providers import get_provider
+from tools.fetch.native_symbol_resolver import (
+    _parse_ldd_output,
+    _parse_pkg_config_flags,
+    build_symbol_provider_index,
+    collect_component_link_context,
+    resolve_strict_native_dependencies,
 )
 from tools.supplychain.auto_vuln_inputs import can_auto_generate, generate_vulns_payload
 from tools.verification.ffi_summaries import resolve_ffi_summary
@@ -477,6 +488,23 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         self.assertIn("revparse_ext", tokens)
         self.assertNotIn("get_changelog_at_tag", raws)
 
+    def test_collect_rust_sink_candidates_preserves_name_regex_conditions(self):
+        rule = {
+            "trigger_model": {
+                "conditions": [
+                    {
+                        "type": "call_code_contains",
+                        "name_regex": "(?i)(^|::)decode$",
+                        "lang": "Rust",
+                        "contains": ["packet"],
+                        "contains_all": False,
+                    }
+                ]
+            },
+        }
+        sinks = collect_rust_sink_candidates(rule)
+        self.assertTrue(any(spec.get("name_regex") == "(?i)(^|::)decode$" for spec in sinks))
+
     def test_synthesize_sink_calls_from_method_code_and_merge(self):
         chain_nodes = [
             {
@@ -493,6 +521,28 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         merged = merge_evidence_calls({"chain_calls": [], "all_calls": []}, synthetic)
         self.assertEqual(len(merged["all_calls"]), 1)
         self.assertEqual(merged["all_calls"][0]["name"], "revparse_ext")
+
+    def test_synthesize_sink_calls_from_method_code_supports_name_regex(self):
+        chain_nodes = [
+            {
+                "id": 7,
+                "labels": ["METHOD", "Rust"],
+                "name": "decode_video",
+                "code": "fn decode_video(decoder:&Decoder, packet:&[u8]){ let _ = decoder.decode(packet); }",
+            }
+        ]
+        synthetic = synthesize_sink_calls_from_method_code(
+            chain_nodes,
+            [
+                {
+                    "name_regex": "(?i)(^|::)decode$",
+                    "contains": ["packet"],
+                    "contains_all": False,
+                }
+            ],
+        )
+        self.assertEqual(len(synthetic), 1)
+        self.assertIn("decode", synthetic[0]["code"])
 
     def test_has_actionable_trigger_hits(self):
         trigger_hits = {
@@ -563,6 +613,31 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         self.assertIn("engine_selected", ids)
         self.assertNotIn("rust_sink_build", ids)
         self.assertEqual(normalized["rule_compile_meta"]["compiled_rust_sink_conditions"], 0)
+
+    def test_auto_generated_pcre2_rule_prefers_jit_builder_evidence(self):
+        rule = generate_vulns_payload({"family": "pcre2", "project": "pomsky-bin"})[0]
+        self.assertTrue(any(sink.get("contains") == ["jit_if_available"] for sink in rule["rust_sinks"]))
+        condition_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("pcre2_jit_builder_chain", condition_ids)
+
+    def test_auto_generated_libjpeg_rule_includes_wrapper_decode_sink(self):
+        rule = generate_vulns_payload({"family": "libjpeg-turbo", "project": "reduce_image_size"})[0]
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("turbojpeg::decompress_image", sink_paths)
+        inner_names = {cond["name"] for cond in rule["trigger_model"]["conditions"][0]["conditions"]}
+        self.assertIn("decompress_image", inner_names)
+
+    def test_auto_generated_openh264_rule_filters_gstreamer_context(self):
+        rule = generate_vulns_payload({"family": "openh264", "project": "jetkvm_client"})[0]
+        generic_sink = next(sink for sink in rule["rust_sinks"] if sink["path"] == "Decoder::decode")
+        self.assertEqual(generic_sink["context_tokens"], ["openh264"])
+        self.assertIn("gstreamer", rule["input_predicate"]["negative_tokens"])
+
+    def test_auto_generated_sqlite_rule_tracks_query_and_prepare_paths(self):
+        rule = generate_vulns_payload({"family": "sqlite", "project": "reef"})[0]
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("rusqlite::Connection::query_row", sink_paths)
+        self.assertIn("rusqlite::Connection::prepare", sink_paths)
 
     def test_analyze_triggerability_requires_chain_nodes(self):
         trigger_model = {
@@ -921,6 +996,12 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
 
 
 class NativeSourceResolverTests(unittest.TestCase):
+    def test_provider_supports_official_download_for_common_components(self):
+        for component in ["libxml2", "zlib", "expat", "openssl", "libwebp"]:
+            provider = get_provider(component)
+            self.assertIsNotNone(provider)
+            self.assertTrue(provider.official_candidates("1.2.3"))
+
     def test_find_local_native_source_tree_prefers_bundled_source_dir(self):
         with TemporaryDirectory() as tmp:
             crate_dir = Path(tmp) / "openh264-sys2-0.4.4"
@@ -959,6 +1040,116 @@ class NativeSourceResolverTests(unittest.TestCase):
             self.assertEqual(len(files), 2)
             scope = choose_c_analysis_scope(str(root), files)
             self.assertEqual(scope, str(dec_dir))
+
+    def test_infer_native_source_dependencies_from_source_tree(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "libxml2-src"
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "parser.c").write_text(
+                '#include <zlib.h>\n#include <openssl/ssl.h>\nint parse(){ return 0; }\n',
+                encoding="utf-8",
+            )
+            (root / "CMakeLists.txt").write_text(
+                "find_package(OpenSSL REQUIRED)\npkg_check_modules(ZLIB REQUIRED zlib)\n",
+                encoding="utf-8",
+            )
+            deps = infer_native_source_dependencies("libxml2", str(root))
+            names = {item["component"] for item in deps}
+            self.assertIn("zlib", names)
+            self.assertIn("openssl", names)
+
+    def test_parse_pkg_config_flags(self):
+        lib_dirs, libs = _parse_pkg_config_flags("-L/usr/lib -L/opt/lib -lssl -lcrypto")
+        self.assertEqual(lib_dirs, ["/usr/lib", "/opt/lib"])
+        self.assertEqual(libs, ["ssl", "crypto"])
+
+    def test_parse_ldd_output(self):
+        rows = _parse_ldd_output(
+            """
+            libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x00007f)
+            libssl.so.3 => /lib/x86_64-linux-gnu/libssl.so.3 (0x00007f)
+            """
+        )
+        self.assertEqual(rows[0]["soname"], "libz.so.1")
+        self.assertEqual(rows[1]["path"], "/lib/x86_64-linux-gnu/libssl.so.3")
+
+    @patch("tools.fetch.native_symbol_resolver.collect_binary_linked_libraries")
+    @patch("tools.fetch.native_symbol_resolver._pkg_config_probe")
+    def test_collect_component_link_context(self, mock_pkg, mock_ldd):
+        mock_pkg.return_value = {"name": "libxml-2.0", "ok": True, "libs": ["xml2"], "lib_dirs": ["/usr/lib"], "version": "2.9.14"}
+        mock_ldd.return_value = [{"soname": "libz.so.1", "path": "/lib/libz.so.1"}]
+        context = collect_component_link_context("libxml2", ["/tmp/libxml2.so"])
+        self.assertIn("xml2", context["linked_tokens"])
+        self.assertIn("z", context["linked_tokens"])
+
+    @patch("tools.fetch.native_symbol_resolver.find_component_binaries")
+    @patch("tools.fetch.native_symbol_resolver.collect_binary_exports")
+    def test_build_symbol_provider_index_uses_binary_exports(self, mock_exports, mock_binaries):
+        mock_binaries.side_effect = lambda component: [f"/tmp/{component}.so"] if component in {"zlib", "openssl"} else []
+        mock_exports.side_effect = lambda path: {"inflate"} if "zlib" in path else {"SSL_read"}
+        index = build_symbol_provider_index(["zlib", "openssl"])
+        self.assertIn("zlib", index)
+        self.assertIn("inflate", index["zlib"]["exports"])
+        self.assertIn("openssl", index)
+        self.assertIn("SSL_read", index["openssl"]["exports"])
+
+    @patch("tools.fetch.native_symbol_resolver.collect_binary_linked_libraries")
+    @patch("tools.fetch.native_symbol_resolver._pkg_config_probe")
+    @patch("tools.fetch.native_symbol_resolver.build_symbol_provider_index")
+    @patch("tools.fetch.native_symbol_resolver.collect_binary_imports")
+    @patch("tools.fetch.native_symbol_resolver.find_component_binaries")
+    def test_resolve_strict_native_dependencies_from_binary_symbols(self, mock_binaries, mock_imports, mock_index, mock_pkg, mock_ldd):
+        mock_binaries.return_value = ["/tmp/libxml2.so"]
+        mock_imports.return_value = {"inflate", "SSL_read", "unresolved_only"}
+        mock_pkg.return_value = {"name": "libxml-2.0", "ok": True, "libs": ["z"], "lib_dirs": ["/usr/lib"], "version": "2.9.14"}
+        mock_ldd.return_value = [{"soname": "libz.so.1", "path": "/lib/libz.so.1"}]
+        mock_index.return_value = {
+            "zlib": {"component": "zlib", "binaries": ["/tmp/libz.so"], "exports": {"inflate"}},
+            "openssl": {"component": "openssl", "binaries": ["/tmp/libssl.so"], "exports": {"SSL_read"}},
+            "libxml2": {"component": "libxml2", "binaries": ["/tmp/libxml2.so"], "exports": {"xmlParseDoc"}},
+        }
+        result = resolve_strict_native_dependencies("libxml2", resolved_version="2.9.14")
+        self.assertEqual(result["status"], "resolved")
+        names = {item["component"] for item in result["dependencies"]}
+        self.assertEqual(names, {"zlib"})
+        self.assertEqual(result["unresolved_symbol_count"], 2)
+        self.assertIn("imports_by_binary", result)
+        self.assertIn("link_context", result)
+
+    def test_register_binary_symbol_inventory_creates_import_and_export_rows(self):
+        session = MagicMock()
+        strict = {
+            "binaries": ["/tmp/libxml2.so"],
+            "imports_by_binary": {"/tmp/libxml2.so": ["inflate"]},
+            "dependencies": [
+                {
+                    "component": "zlib",
+                    "provider_binaries": ["/tmp/libz.so"],
+                    "provider_export_sample": ["inflate"],
+                    "evidence": [{"binary": "/tmp/libxml2.so", "symbol": "inflate"}],
+                }
+            ],
+        }
+        stats = register_binary_symbol_inventory(session, "libxml2", strict)
+        self.assertEqual(stats["binaries"], 1)
+        self.assertEqual(stats["imports"], 1)
+        self.assertGreaterEqual(stats["exports"], 1)
+        self.assertGreaterEqual(session.run.call_count, 4)
+
+    def test_resolve_external_c_calls_to_binary_symbols_emits_queries(self):
+        session = MagicMock()
+        strict = {
+            "dependencies": [
+                {
+                    "component": "zlib",
+                    "provider_binaries": ["/tmp/libz.so"],
+                    "evidence": [{"binary": "/tmp/libxml2.so", "symbol": "inflate"}],
+                }
+            ]
+        }
+        edges = resolve_external_c_calls_to_binary_symbols(session, "libxml2", strict)
+        self.assertEqual(edges, 1)
+        self.assertEqual(session.run.call_count, 1)
 
 
 if __name__ == "__main__":
