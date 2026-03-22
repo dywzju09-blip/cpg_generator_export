@@ -1,0 +1,7 @@
+interface:
+  display_name: "ANALYSIS"
+  short_description: "Run end-to-end supply-chain analysis and archive classified results"
+  default_prompt: "Use $ANALYSIS to analyze Rust projects end-to-end, repair missing native prerequisites when possible, classify results into VUL/cases/by-analysis-status, and record concrete failure reasons."
+
+policy:
+  allow_implicit_invocation: true
