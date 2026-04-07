@@ -1,4 +1,5 @@
 import json
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from tools.supplychain.run_manifest_analysis import (
     extract_summary_fields,
     prepare_vulns_input,
+    validate_analysis_runtime,
 )
 
 
@@ -115,6 +117,28 @@ class RunManifestAnalysisTests(unittest.TestCase):
                     vulns_path, error = prepare_vulns_input(item, case_dir)
             self.assertIsNone(vulns_path)
             self.assertIn("no project-specific vulnerability rules matched", error)
+
+    def test_validate_analysis_runtime_accepts_available_dependency(self):
+        with patch(
+            "tools.supplychain.run_manifest_analysis.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["python3"], returncode=0, stdout="", stderr=""),
+        ):
+            self.assertIsNone(validate_analysis_runtime("/tmp/python3"))
+
+    def test_validate_analysis_runtime_reports_missing_neo4j(self):
+        with patch(
+            "tools.supplychain.run_manifest_analysis.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["python3"],
+                returncode=1,
+                stdout="",
+                stderr="ModuleNotFoundError: No module named 'neo4j'",
+            ),
+        ):
+            error = validate_analysis_runtime("/usr/bin/python3")
+        self.assertIn("analysis runtime check failed", error)
+        self.assertIn("neo4j", error)
+        self.assertIn("/usr/bin/python3", error)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,13 @@ _C_FAMILY_EXTENSIONS = {
     ".hxx",
 }
 
+_C_IMPL_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+}
+
 
 def _normalize_component(component):
     return canonical_component_name(component).strip().lower()
@@ -246,6 +253,52 @@ def find_symbol_source_files(source_root, symbols, max_hits_per_symbol=8):
     return hits
 
 
+def find_symbol_definition_files(source_root, symbols, max_hits_per_symbol=4):
+    if not source_root or not os.path.isdir(source_root):
+        return []
+    normalized_symbols = [str(sym or "").strip() for sym in (symbols or []) if str(sym or "").strip()]
+    if not normalized_symbols:
+        return []
+
+    patterns = [
+        (
+            sym,
+            re.compile(
+                rf"(?m)^[\t ]*(?:[A-Za-z_][\w\s\*\(\),]*?\s+)?{re.escape(sym)}\s*\([^;\n{{}}]*\)\s*\{{"
+            ),
+        )
+        for sym in normalized_symbols
+    ]
+    hits = []
+    seen = set()
+    per_symbol = {sym: 0 for sym in normalized_symbols}
+
+    for base, _, files in os.walk(source_root):
+        for name in files:
+            _, ext = os.path.splitext(name)
+            if ext.lower() not in _C_IMPL_EXTENSIONS:
+                continue
+            file_path = os.path.join(base, name)
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read()
+            except Exception:
+                continue
+            matched = False
+            for sym, regex in patterns:
+                if per_symbol[sym] >= max_hits_per_symbol:
+                    continue
+                if regex.search(text):
+                    per_symbol[sym] += 1
+                    matched = True
+            if matched:
+                abs_path = os.path.abspath(file_path)
+                if abs_path not in seen:
+                    seen.add(abs_path)
+                    hits.append(abs_path)
+    return hits
+
+
 def choose_c_analysis_scope(source_root, symbol_files):
     root = os.path.abspath(source_root) if source_root else ""
     files = _dedupe_paths(symbol_files)
@@ -265,6 +318,38 @@ def choose_c_analysis_scope(source_root, symbol_files):
     if common_dir and common_dir.startswith(root):
         return common_dir
     return root
+
+
+def choose_c_analysis_scope_from_relative_paths(source_root, relative_paths):
+    root = os.path.abspath(source_root) if source_root else ""
+    if not root or not os.path.isdir(root):
+        return ""
+
+    dirs = []
+    seen = set()
+    for rel in relative_paths or []:
+        rel_text = str(rel or "").strip().replace("\\", "/")
+        if not rel_text:
+            continue
+        abs_path = os.path.abspath(os.path.join(root, rel_text))
+        candidate = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+        if not candidate.startswith(root) or not os.path.isdir(candidate):
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            dirs.append(candidate)
+
+    if not dirs:
+        return ""
+    if len(dirs) == 1:
+        return dirs[0]
+    try:
+        common_dir = os.path.commonpath(dirs)
+    except ValueError:
+        return ""
+    if common_dir and common_dir.startswith(root) and common_dir != root:
+        return common_dir
+    return ""
 
 
 def infer_native_source_dependencies(component, source_root):

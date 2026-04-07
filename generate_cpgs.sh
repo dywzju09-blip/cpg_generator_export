@@ -157,12 +157,26 @@ elif [[ "$LANG" == "c" ]]; then
     EXPORT_DIR="$ABS_OUTPUT/cpg_export"
     JSON_OUTPUT="$ABS_OUTPUT/cpg_final.json"
 
+    # Give Joern explicit heap settings instead of relying on JVM defaults.
+    # These can still be overridden by the caller if needed.
+    JOERN_PARSE_JAVA_TOOL_OPTIONS_DEFAULT="-Xms4g -Xmx32g -XX:+UseG1GC"
+    JOERN_EXPORT_JAVA_TOOL_OPTIONS_DEFAULT="-Xms8g -Xmx96g -XX:+UseG1GC"
+    JOERN_PARSE_JAVA_TOOL_OPTIONS="${JOERN_PARSE_JAVA_TOOL_OPTIONS:-$JOERN_PARSE_JAVA_TOOL_OPTIONS_DEFAULT}"
+    JOERN_EXPORT_JAVA_TOOL_OPTIONS="${JOERN_EXPORT_JAVA_TOOL_OPTIONS:-$JOERN_EXPORT_JAVA_TOOL_OPTIONS_DEFAULT}"
+
+    if [[ -n "${JAVA_TOOL_OPTIONS:-}" ]]; then
+        JOERN_PARSE_JAVA_TOOL_OPTIONS="$JOERN_PARSE_JAVA_TOOL_OPTIONS $JAVA_TOOL_OPTIONS"
+        JOERN_EXPORT_JAVA_TOOL_OPTIONS="$JOERN_EXPORT_JAVA_TOOL_OPTIONS $JAVA_TOOL_OPTIONS"
+    fi
+
     # 1. Joern Parse
-    joern-parse "$ABS_INPUT" --output "$BIN_OUTPUT"
+    JAVA_TOOL_OPTIONS="$JOERN_PARSE_JAVA_TOOL_OPTIONS" \
+        joern-parse "$ABS_INPUT" --output "$BIN_OUTPUT"
 
     # 2. Joern Export
     rm -rf "$EXPORT_DIR"
-    joern-export "$BIN_OUTPUT" --repr all --format graphml --out "$EXPORT_DIR"
+    JAVA_TOOL_OPTIONS="$JOERN_EXPORT_JAVA_TOOL_OPTIONS" \
+        joern-export "$BIN_OUTPUT" --repr all --format graphml --out "$EXPORT_DIR"
 
     # 3. Convert to JSON
     echo "    Converting GraphML to JSON..."

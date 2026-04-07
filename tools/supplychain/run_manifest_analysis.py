@@ -140,6 +140,8 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     cpg_input_value = item.get("cpg_input") or item.get("input_file")
     if cpg_input_value:
         normalized["cpg_input"] = _expand_manifest_path(cpg_input_value)
+    if item.get("manual_evidence"):
+        normalized["manual_evidence"] = _expand_manifest_path(item["manual_evidence"])
     normalized["project"] = item.get("project") or project
     normalized["version"] = item.get("version") or version
     normalized["rel"] = rel
@@ -257,6 +259,31 @@ def prepare_vulns_input(item: dict[str, Any], case_dir: Path) -> tuple[Path | No
     return vulns_path, None
 
 
+def validate_analysis_runtime(python_executable: str) -> str | None:
+    probe = [python_executable, "-c", "from neo4j import GraphDatabase"]
+    try:
+        result = subprocess.run(
+            probe,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return f"error: analysis interpreter is unavailable: {python_executable}: {exc}"
+    if result.returncode == 0:
+        return None
+    detail = (result.stderr or result.stdout or "").strip()
+    if not detail:
+        detail = f"probe exited with status {result.returncode}"
+    return (
+        "error: analysis runtime check failed; "
+        f"{python_executable} cannot import the `neo4j` Python package required by "
+        "`tools/supplychain/supplychain_analyze.py`. "
+        "Rerun the batch with the same Python environment that has the analyzer dependencies installed. "
+        f"Probe detail: {detail}"
+    )
+
+
 def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_source_supplement: bool = False) -> list[str]:
     inputs_dir = run_case_dir / "analysis_inputs"
     report_path = run_case_dir / "analysis_report.json"
@@ -276,8 +303,12 @@ def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_so
         cmd.extend(["--root", str(item["root"])])
     if item.get("cpg_input"):
         cmd.extend(["--cpg-input", str(item["cpg_input"])])
+    if item.get("cpg_json"):
+        cmd.extend(["--cpg-json", str(item["cpg_json"]), "--skip-cpg-generation"])
     if (inputs_dir / "extras.json").exists():
         cmd.extend(["--extras", str(inputs_dir / "extras.json")])
+    if item.get("manual_evidence"):
+        cmd.extend(["--manual-evidence", str(item["manual_evidence"])])
     if item.get("cargo_features"):
         cmd.extend(["--cargo-features", str(item["cargo_features"])])
     if item.get("cargo_all_features"):
@@ -303,14 +334,21 @@ def extract_summary_fields(report_path: Path, item: dict[str, Any] | None = None
         }
     vuln, validation_error = primary_vuln_for_item(report_path, item or {})
     if not vuln:
+        try:
+            report = load_json(report_path)
+        except Exception:
+            report = {}
+        bootstrap = report.get("cpg_bootstrap") if isinstance(report, dict) else {}
+        report_generated = bool(report)
+        cpg_imported = bool((bootstrap or {}).get("imported"))
         return {
             "reachable": False,
-            "triggerable": None,
-            "result_kind": None,
+            "triggerable": "unreachable" if report_generated else None,
+            "result_kind": "NoReachabilityEvidence" if report_generated else None,
             "resolved_version": None,
             "symbol": None,
             "component": None,
-            "status": "analysis_failed",
+            "status": "not_reachable" if report_generated or cpg_imported else "analysis_failed",
             "validation_error": validation_error,
         }
     reachable = bool(vuln.get("reachable"))
@@ -320,6 +358,10 @@ def extract_summary_fields(report_path: Path, item: dict[str, Any] | None = None
         status = "analysis_failed"
         reachable = False
         triggerable = None
+    elif vuln.get("manual_trigger_status") == "observable_triggered":
+        status = "observable_triggered"
+    elif vuln.get("manual_trigger_status") == "path_triggered":
+        status = "path_triggered"
     elif triggerable == "confirmed":
         status = "triggerable_confirmed"
     elif triggerable == "possible":
@@ -339,6 +381,8 @@ def extract_summary_fields(report_path: Path, item: dict[str, Any] | None = None
         "component": vuln.get("package"),
         "status": status,
         "validation_error": validation_error,
+        "manual_trigger_status": vuln.get("manual_trigger_status"),
+        "manual_evidence": vuln.get("manual_evidence"),
     }
 
 
@@ -436,7 +480,8 @@ def run_one(
         timed_out = True
         exit_code = -15
         stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + f"\nTimed out after {timeout_seconds} seconds."
+        stderr_bytes = exc.stderr or b""
+        stderr = (stderr_bytes.decode("utf-8", errors="replace") if isinstance(stderr_bytes, bytes) else stderr_bytes) + f"\nTimed out after {timeout_seconds} seconds."
     seconds = round(time.time() - start, 2)
 
     log_path = case_dir / "run.log"
@@ -553,6 +598,11 @@ def main() -> int:
     if run_root.exists():
         shutil.rmtree(run_root)
     ensure_dir(run_root)
+
+    runtime_error = validate_analysis_runtime(sys.executable)
+    if runtime_error:
+        print(runtime_error, file=sys.stderr)
+        return 2
 
     raw_manifest = load_json(manifest_path)
     items = raw_manifest.get("items", raw_manifest) if isinstance(raw_manifest, dict) else raw_manifest

@@ -9,22 +9,29 @@ import re
 from pathlib import Path
 from typing import Any
 
+try:
+    from tools.supplychain.vuln_db_seed import COMPONENTS
+except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+    from vuln_db_seed import COMPONENTS
 
-FAMILY_COMPONENTS = {
-    "zlib": "zlib",
-    "libxml2": "libxml2",
-    "libheif": "libheif",
-    "libwebp": "libwebp",
-    "libgit2": "libgit2",
-    "sqlite": "sqlite",
-    "pcre2": "pcre2",
-    "openssl": "openssl",
-    "gdal": "gdal",
-    "openh264": "openh264-sys2",
-    "freetype": "freetype",
-    "gstreamer": "gstreamer",
-    "libjpeg-turbo": "libjpeg-turbo",
-}
+
+COMPONENT_METADATA = {item["component"]: item for item in COMPONENTS}
+
+FAMILY_COMPONENTS = {item["component"]: item["component"] for item in COMPONENTS}
+FAMILY_COMPONENTS["openh264"] = "openh264-sys2"
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_")
 
 
 def _split_tokens(text: str) -> list[str]:
@@ -53,7 +60,16 @@ def _context_from_item(item: dict[str, Any]) -> list[str]:
 
 def _match_crates(item: dict[str, Any], defaults: list[str]) -> list[str]:
     crates = list(defaults)
-    for dep in item.get("dependency_evidence") or []:
+    dep_evidence = item.get("dependency_evidence")
+    if isinstance(dep_evidence, dict):
+        dep_iter = [dep_evidence]
+    elif isinstance(dep_evidence, list):
+        dep_iter = dep_evidence
+    else:
+        dep_iter = []
+    for dep in dep_iter:
+        if not isinstance(dep, dict):
+            continue
         crate = str((dep or {}).get("crate") or "").strip()
         if crate and crate not in crates:
             crates.append(crate)
@@ -63,6 +79,87 @@ def _match_crates(item: dict[str, Any], defaults: list[str]) -> list[str]:
 def _generic_description(item: dict[str, Any], component: str, detail: str) -> str:
     source = item.get("source_label") or "auto-generated family rule"
     return f"{detail} ({item.get('project') or 'project'}; {component}; {source})."
+
+
+def _component_meta(family: str) -> dict[str, Any]:
+    meta = COMPONENT_METADATA.get(family)
+    if not meta:
+        raise KeyError(f"No component metadata for family={family!r}")
+    return meta
+
+
+def _component_crates(meta: dict[str, Any]) -> list[str]:
+    return _dedupe(
+        list(meta.get("package_aliases") or [])
+        + list(meta.get("sys_crates") or [])
+        + list(meta.get("high_level_crates") or [])
+    )
+
+
+def _generic_component_rule(item: dict[str, Any]) -> dict[str, Any]:
+    family = str(item.get("family") or "").strip().lower()
+    meta = _component_meta(family)
+    package = meta["component"]
+    positive_tokens = _dedupe(list(meta.get("input_tokens") or []) + _context_from_item(item) + [family, package])
+    rust_entrypoints = _dedupe(list(meta.get("rust_entrypoints") or []))
+    native_symbols = _dedupe(list(meta.get("native_symbols") or []))
+    trigger_conditions: list[dict[str, Any]] = []
+    if rust_entrypoints:
+        trigger_conditions.append(
+            {
+                "id": f"{_slug(family)}_entry_any",
+                "type": "any_of",
+                "conditions": [
+                    {"id": f"{_slug(family)}_rust_sink_{idx}", "type": "call", "name": path, "lang": "Rust"}
+                    for idx, path in enumerate(rust_entrypoints[:12])
+                ],
+            }
+        )
+    elif native_symbols:
+        trigger_conditions.append(
+            {
+                "id": f"{_slug(family)}_native_entry_any",
+                "type": "any_of",
+                "conditions": [
+                    {"id": f"{_slug(family)}_native_symbol_{idx}", "type": "call", "name": symbol}
+                    for idx, symbol in enumerate(native_symbols[:12])
+                ],
+            }
+        )
+    trigger_conditions.append(
+        {
+            "id": f"{_slug(family)}_input",
+            "type": "input_class",
+            "class": meta.get("input_class") or "crafted_input",
+            "positive_tokens": positive_tokens[:12],
+            "negative_tokens": [],
+            "strategy": "assume_if_not_explicit",
+        }
+    )
+    return {
+        "cve": item.get("cve") or f"{package.upper()}-FAMILY",
+        "package": package,
+        "version_range": item.get("version_range") or ">=0",
+        "match": {
+            "crates": _match_crates(item, _component_crates(meta)),
+        },
+        "symbols": native_symbols[:12],
+        "source_status": meta.get("default_source") or "system",
+        "enforce_rust_sinks": False,
+        "rust_sinks": [{"path": path} for path in rust_entrypoints[:12]],
+        "input_predicate": {
+            "class": meta.get("input_class") or "crafted_input",
+            "positive_tokens": positive_tokens[:12],
+            "negative_tokens": [],
+            "strategy": "assume_if_not_explicit",
+        },
+        "context_patterns": _dedupe([family, package] + positive_tokens)[:16],
+        "trigger_model": {
+            "conditions": trigger_conditions,
+            "mitigations": [],
+        },
+        "description": _generic_description(item, package, f"Generic {package} processing path"),
+    }
 
 
 def _build_libxml2_rule(item: dict[str, Any]) -> dict[str, Any]:
@@ -83,7 +180,7 @@ def _build_libxml2_rule(item: dict[str, Any]) -> dict[str, Any]:
             "xmlC14NDocDumpMemory",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "xmlReadMemory"},
             {"path": "htmlReadMemory"},
@@ -101,6 +198,33 @@ def _build_libxml2_rule(item: dict[str, Any]) -> dict[str, Any]:
             "strategy": "assume_if_not_explicit",
         },
         "context_patterns": list(dict.fromkeys(["xml", "html", "xpath", "schema", "c14n", "document", "parser", "xslt", "xmlsec"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "libxml2_parse_entry",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "rust_sink_parse_string", "type": "call", "name": "Parser::parse_string", "lang": "Rust"},
+                        {"id": "rust_sink_parse_file", "type": "call", "name": "Parser::parse_file", "lang": "Rust"},
+                        {"id": "rust_sink_parse_reader", "type": "call", "name": "Parser::parse_reader", "lang": "Rust"},
+                        {"id": "rust_sink_xmlReadMemory", "type": "call", "name": "xmlReadMemory"},
+                        {"id": "rust_sink_htmlReadMemory", "type": "call", "name": "htmlReadMemory"},
+                        {"id": "rust_sink_xmlReadDoc", "type": "call", "name": "xmlReadDoc"},
+                        {"id": "rust_sink_htmlReadDoc", "type": "call", "name": "htmlReadDoc"},
+                        {"id": "rust_sink_xmlParseChunk", "type": "call", "name": "xmlParseChunk"},
+                    ],
+                },
+                {
+                    "id": "libxml2_input",
+                    "type": "input_class",
+                    "class": "crafted_xml_or_html_input",
+                    "positive_tokens": ["xml", "html", "parser", "document", "xpath", "schema", "c14n"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "libxml2", "Generic libxml2 parse/transform path"),
     }
 
@@ -118,7 +242,7 @@ def _build_zlib_rule(item: dict[str, Any]) -> dict[str, Any]:
             "inflate",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "inflateGetHeader"},
         ],
@@ -178,7 +302,7 @@ def _build_libheif_rule(item: dict[str, Any]) -> dict[str, Any]:
             "heif_decode_image",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "HeifContext::read_from_file"},
             {"path": "HeifContext::read_from_bytes"},
@@ -208,18 +332,49 @@ def _build_libwebp_rule(item: dict[str, Any]) -> dict[str, Any]:
             "WebPDecodeRGBA",
             "WebPDecodeBGRA",
         ],
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "webp::Decoder::new"},
             {"path": "webp::Decoder::decode"},
             {"path": "Decoder::new", "context_tokens": ["webp"], "contains": ["decode"], "contains_all": False},
             {"path": "Decoder::decode", "context_tokens": ["webp"]},
+            {"path": "libwebp::WebPDecodeRGBA"},
+            {"path": "libwebp::WebPDecodeRGB"},
+            {"path": "WebPDecodeRGBA", "context_tokens": ["webp"]},
+            {"path": "WebPDecodeRGB", "context_tokens": ["webp"]},
+            {"path": "webp_load_rgba_from_memory"},
+            {"path": "webp_load_rgb_from_memory"},
         ],
         "input_predicate": {
             "class": "crafted_webp_lossless",
             "strategy": "assume_if_not_explicit",
         },
         "context_patterns": list(dict.fromkeys(["webp", "image", "thumbnail", "decode", "compress"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "libwebp_decode_entry",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "decoder_new", "type": "call", "name": "webp::Decoder::new", "lang": "Rust"},
+                        {"id": "decoder_decode", "type": "call", "name": "webp::Decoder::decode", "lang": "Rust"},
+                        {"id": "decode_rgba", "type": "call", "name": "WebPDecodeRGBA", "lang": "Rust"},
+                        {"id": "decode_rgb", "type": "call", "name": "WebPDecodeRGB", "lang": "Rust"},
+                        {"id": "decode_wrapper_rgba", "type": "call", "name": "webp_load_rgba_from_memory", "lang": "Rust"},
+                        {"id": "decode_wrapper_rgb", "type": "call", "name": "webp_load_rgb_from_memory", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "libwebp_input",
+                    "type": "input_class",
+                    "class": "crafted_webp_lossless",
+                    "positive_tokens": ["webp", "image", "decode", "thumbnail", "rgba", "rgb"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "libwebp", "Generic WebP decode path"),
     }
 
@@ -237,7 +392,7 @@ def _build_libgit2_rule(item: dict[str, Any]) -> dict[str, Any]:
             "git_revparse_ext",
         ],
         "source_status": "bundled",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "git2::Repository::revparse_single"},
             {"path": "git2::Repository::revparse_ext"},
@@ -257,70 +412,73 @@ def _build_libgit2_rule(item: dict[str, Any]) -> dict[str, Any]:
 
 def _build_pcre2_rule(item: dict[str, Any]) -> dict[str, Any]:
     return {
-        "cve": item.get("cve", "CVE-2022-1586"),
+        "cve": item.get("cve", "CVE-2025-58050"),
         "package": "pcre2-sys",
-        "version_range": "<10.40",
+        "version_range": ">=10.45,<10.46",
         "match": {
-            "crates": _match_crates(item, ["pcre2", "pcre2-sys"]),
+            "crates": _match_crates(item, ["pcre2", "pcre2-sys", "grep-pcre2"]),
         },
         "symbols": [
-            "pcre2_jit_compile_8",
+            "pcre2_match_8",
+            "pcre2_match",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
-            {"path": "pcre2::bytes::RegexBuilder::build", "contains": ["jit_if_available"], "contains_all": False},
-            {"path": "RegexBuilder::build", "context_tokens": ["pcre2"], "contains": ["jit_if_available"], "contains_all": False},
+            {"path": "pcre2::bytes::RegexBuilder::build"},
+            {"path": "RegexBuilder::build", "context_tokens": ["pcre2"]},
+            {"path": "pcre2::bytes::Regex::captures"},
+            {"path": "pcre2::bytes::Regex::is_match"},
+            {"path": "pcre2::bytes::Regex::find_iter"},
+            {"path": "Regex::captures", "context_tokens": ["pcre2"]},
+            {"path": "Regex::is_match", "context_tokens": ["pcre2"]},
+            {"path": "Regex::find_iter", "context_tokens": ["pcre2"]},
             {"path": "grep_pcre2::RegexMatcherBuilder::build"},
+            {"path": "grep_pcre2::RegexMatcher::new"},
+            {"path": "RegexMatcherBuilder::build", "context_tokens": ["pcre2", "regex", "matcher"]},
+            {"path": "RegexMatcher::new", "context_tokens": ["pcre2", "regex", "matcher"]},
         ],
-        "env_guards": {
-            "all": [
-                {"type": "feature_enabled", "feature": "jit"},
-            ]
-        },
         "input_predicate": {
-            "class": "crafted_regex_pattern",
-            "positive_tokens": ["regex", "pattern", "jit", "pcre2"],
+            "class": "crafted_pcre2_scan_substring_pattern",
+            "positive_tokens": ["regex", "pattern", "pcre2", "scs", "scan", "substring", "accept"],
             "negative_tokens": [],
             "strategy": "assume_if_not_explicit",
         },
-        "context_patterns": list(dict.fromkeys(["pcre2", "regex", "jit", "pattern", "grep", "match"] + _context_from_item(item))),
+        "context_patterns": list(
+            dict.fromkeys(["pcre2", "regex", "pattern", "scs", "scan", "substring", "accept", "match"] + _context_from_item(item))
+        ),
         "trigger_model": {
             "conditions": [
                 {
-                    "id": "pcre2_jit_builder_chain",
+                    "id": "pcre2_pattern_build",
                     "type": "any_of",
                     "conditions": [
-                        {
-                            "id": "pcre2_jit_builder_flags",
-                            "type": "builder_flag_chain",
-                            "sink": {"name": "RegexBuilder::build", "lang": "Rust"},
-                            "setters": [
-                                {"name": "jit_if_available", "lang": "Rust", "contains": ["true"], "contains_all": False},
-                            ],
-                        },
-                        {
-                            "id": "pcre2_jit_build_snippet",
-                            "type": "call_code_contains",
-                            "name": "RegexBuilder::build",
-                            "lang": "Rust",
-                            "contains": ["jit_if_available", "pcre2", "RegexBuilder"],
-                            "contains_all": False,
-                        },
+                        {"id": "pcre2_builder_build", "type": "call", "name": "RegexBuilder::build", "lang": "Rust"},
+                        {"id": "pcre2_grep_wrapper_build", "type": "call", "name": "RegexMatcherBuilder::build", "lang": "Rust"},
+                        {"id": "pcre2_wrapper_new", "type": "call", "name": "RegexMatcher::new", "lang": "Rust"},
                     ],
                 },
                 {
-                    "id": "pcre2_pattern_input",
+                    "id": "pcre2_match_use",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "pcre2_regex_captures", "type": "call", "name": "Regex::captures", "lang": "Rust"},
+                        {"id": "pcre2_regex_is_match", "type": "call", "name": "Regex::is_match", "lang": "Rust"},
+                        {"id": "pcre2_regex_find_iter", "type": "call", "name": "Regex::find_iter", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "pcre2_scan_substring_pattern",
                     "type": "input_class",
-                    "class": "crafted_regex_pattern",
-                    "positive_tokens": ["regex", "pattern", "jit", "pcre2"],
+                    "class": "crafted_pcre2_scan_substring_pattern",
+                    "positive_tokens": ["regex", "pattern", "pcre2", "scs", "scan", "substring", "accept"],
                     "negative_tokens": [],
                     "strategy": "assume_if_not_explicit",
                 },
             ],
             "mitigations": [],
         },
-        "description": _generic_description(item, "PCRE2", "Generic PCRE2 JIT compile path"),
+        "description": _generic_description(item, "PCRE2", "Generic PCRE2 scan-substring + ACCEPT match path"),
     }
 
 
@@ -338,7 +496,7 @@ def _build_sqlite_rule(item: dict[str, Any]) -> dict[str, Any]:
             "sqlite3_exec",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "rusqlite::Connection::execute"},
             {"path": "rusqlite::Connection::execute_batch"},
@@ -385,6 +543,73 @@ def _build_sqlite_rule(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_libarchive_rule(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "cve": item.get("cve", "LIBARCHIVE-2025-FAMILY"),
+        "package": "libarchive",
+        "version_range": ">=0",
+        "match": {
+            "crates": _match_crates(item, ["compress-tools", "libarchive", "libarchive3-sys"]),
+        },
+        "symbols": [
+            "archive_read_open_filename",
+            "archive_read_open_memory",
+            "archive_read_open_fd",
+            "archive_read_next_header",
+            "archive_read_data",
+            "archive_read_data_block",
+        ],
+        "source_status": "system",
+        "enforce_rust_sinks": False,
+        "rust_sinks": [
+            {"path": "compress_tools::ArchiveIterator::from_read"},
+            {"path": "ArchiveIterator::from_read", "context_tokens": ["compress", "archive"]},
+            {"path": "compress_tools::ArchiveIterator::from_read_with_encoding"},
+            {"path": "ArchiveIterator::from_read_with_encoding", "context_tokens": ["compress", "archive"]},
+            {"path": "compress_tools::list_archive_files"},
+            {"path": "list_archive_files", "context_tokens": ["compress", "archive"]},
+            {"path": "compress_tools::uncompress_archive"},
+            {"path": "uncompress_archive", "context_tokens": ["compress", "archive"]},
+            {"path": "compress_tools::uncompress_archive_file"},
+            {"path": "uncompress_archive_file", "context_tokens": ["compress", "archive"]},
+        ],
+        "input_predicate": {
+            "class": "crafted_archive_file",
+            "positive_tokens": ["archive", "tar", "zip", "cpio", "7z", "rar", "extract", "uncompress"],
+            "negative_tokens": [],
+            "strategy": "assume_if_not_explicit",
+        },
+        "context_patterns": list(
+            dict.fromkeys(["archive", "libarchive", "compress", "extract", "tar", "zip", "cpio", "7z", "rar"] + _context_from_item(item))
+        ),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "libarchive_entry",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "archive_iterator_from_read", "type": "call", "name": "ArchiveIterator::from_read", "lang": "Rust"},
+                        {"id": "archive_iterator_from_read_with_encoding", "type": "call", "name": "ArchiveIterator::from_read_with_encoding", "lang": "Rust"},
+                        {"id": "list_archive_files", "type": "call", "name": "list_archive_files", "lang": "Rust"},
+                        {"id": "uncompress_archive", "type": "call", "name": "uncompress_archive", "lang": "Rust"},
+                        {"id": "uncompress_archive_file", "type": "call", "name": "uncompress_archive_file", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "libarchive_input",
+                    "type": "input_class",
+                    "class": "crafted_archive_file",
+                    "positive_tokens": ["archive", "tar", "zip", "cpio", "7z", "rar", "extract", "uncompress"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
+        "description": _generic_description(item, "libarchive", "Generic libarchive open/list/extract path"),
+    }
+
+
 def _build_openssl_rule(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "cve": item.get("cve", "CVE-2022-3602"),
@@ -412,7 +637,7 @@ def _build_openssl_rule(item: dict[str, Any]) -> dict[str, Any]:
             "SSL_do_handshake",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "SslConnector::builder"},
             {"path": "SslConnector::connect"},
@@ -545,7 +770,7 @@ def _build_gdal_rule(item: dict[str, Any]) -> dict[str, Any]:
             "GDALRasterIOEx",
         ],
         "source_status": "system",
-        "enforce_rust_sinks": True,
+        "enforce_rust_sinks": False,
         "rust_sinks": [
             {"path": "gdal::Dataset::open"},
             {"path": "gdal::Dataset::open_ex"},
@@ -571,6 +796,29 @@ def _build_gdal_rule(item: dict[str, Any]) -> dict[str, Any]:
             "strategy": "assume_if_not_explicit",
         },
         "context_patterns": list(dict.fromkeys(["gdal", "dataset", "raster", "driver", "pcidsk", "pix", "geospatial"] + _context_from_item(item))),
+        "trigger_model": {
+            "conditions": [
+                {
+                    "id": "gdal_dataset_entry",
+                    "type": "any_of",
+                    "conditions": [
+                        {"id": "dataset_open", "type": "call", "name": "Dataset::open", "lang": "Rust"},
+                        {"id": "dataset_open_ex", "type": "call", "name": "Dataset::open_ex", "lang": "Rust"},
+                        {"id": "raster_read_as", "type": "call", "name": "RasterBand::read_as", "lang": "Rust"},
+                        {"id": "raster_read_into_slice", "type": "call", "name": "RasterBand::read_into_slice", "lang": "Rust"},
+                    ],
+                },
+                {
+                    "id": "gdal_input",
+                    "type": "input_class",
+                    "class": "crafted_gdal_dataset",
+                    "positive_tokens": ["gdal", "dataset", "raster", "pcidsk", "pix", "path", "driver"],
+                    "negative_tokens": [],
+                    "strategy": "assume_if_not_explicit",
+                },
+            ],
+            "mitigations": [],
+        },
         "description": _generic_description(item, "GDAL", "Generic GDAL dataset open/raster read path for PCIDSK-triggered parsing"),
     }
 
@@ -707,6 +955,7 @@ def _build_freetype_rule(item: dict[str, Any]) -> dict[str, Any]:
 
 RULE_BUILDERS = {
     "zlib": _build_zlib_rule,
+    "libarchive": _build_libarchive_rule,
     "libxml2": _build_libxml2_rule,
     "libheif": _build_libheif_rule,
     "libwebp": _build_libwebp_rule,
@@ -724,12 +973,16 @@ RULE_BUILDERS = {
 
 def can_auto_generate(item: dict[str, Any]) -> bool:
     family = str(item.get("family") or "").strip().lower()
-    return family in RULE_BUILDERS
+    return family in RULE_BUILDERS or family in COMPONENT_METADATA
 
 
 def generate_vulns_payload(item: dict[str, Any]) -> list[dict[str, Any]]:
     family = str(item.get("family") or "").strip().lower()
     builder = RULE_BUILDERS.get(family)
+    if builder:
+        return [builder(item)]
+    if family in COMPONENT_METADATA:
+        return [_generic_component_rule(item)]
     if not builder:
         raise KeyError(f"No auto rule template for family={family!r}")
     return [builder(item)]

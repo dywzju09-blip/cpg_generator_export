@@ -311,10 +311,10 @@ def build_component_knowledge(components: list[dict]) -> dict:
 def main() -> None:
     component_map = {item["component"]: build_component_record(item) for item in COMPONENTS}
     all_vulnerabilities = merged_vulnerabilities()
-    if len(component_map) != 30:
-        raise RuntimeError(f"expected 30 components, got {len(component_map)}")
-    if len(VULNERABILITIES) != 30:
-        raise RuntimeError(f"expected 30 manual vulnerabilities, got {len(VULNERABILITIES)}")
+    if len(component_map) < 30:
+        raise RuntimeError(f"expected at least 30 components, got {len(component_map)}")
+    if len(VULNERABILITIES) < 30:
+        raise RuntimeError(f"expected at least 30 manual vulnerabilities, got {len(VULNERABILITIES)}")
     if len(all_vulnerabilities) < len(VULNERABILITIES):
         raise RuntimeError("merged vulnerability set is smaller than manual vulnerability set")
 

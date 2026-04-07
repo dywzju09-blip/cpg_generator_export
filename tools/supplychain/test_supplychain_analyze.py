@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 from tools.supplychain.supplychain_analyze import (
     analyze_triggerability,
+    apply_manual_evidence,
+    collect_package_native_gateway_calls,
+    collect_source_native_gateway_calls,
     collect_source_synthetic_sink_calls,
+    _filter_speculative_source_features,
     _match_call_name,
     _SYSTEM_NATIVE_VERSION_CACHE,
     apply_sink_knowledge,
@@ -14,10 +18,19 @@ from tools.supplychain.supplychain_analyze import (
     eval_condition,
     evaluate_env_guards,
     evaluate_input_predicate,
+    has_cross_language_native_evidence,
     has_actionable_trigger_hits,
+    has_dependency_source_symbol_bridge,
+    has_explicit_native_symbol_bridge,
+    _native_symbol_names_match,
+    has_transitive_native_symbol_bridge,
+    find_best_dep_chain,
+    maybe_collect_expanded_feature_deps,
     map_result_kind,
     merge_evidence_calls,
     normalize_vuln_rule,
+    select_manual_evidence,
+    select_relevant_native_gateway_calls,
     register_binary_symbol_inventory,
     resolve_native_component_instances,
     resolve_external_c_calls_to_binary_symbols,
@@ -614,11 +627,19 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         self.assertNotIn("rust_sink_build", ids)
         self.assertEqual(normalized["rule_compile_meta"]["compiled_rust_sink_conditions"], 0)
 
-    def test_auto_generated_pcre2_rule_prefers_jit_builder_evidence(self):
+    def test_auto_generated_pcre2_rule_tracks_scan_substring_match_path(self):
         rule = generate_vulns_payload({"family": "pcre2", "project": "pomsky-bin"})[0]
-        self.assertTrue(any(sink.get("contains") == ["jit_if_available"] for sink in rule["rust_sinks"]))
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("pcre2::bytes::Regex::captures", sink_paths)
+        self.assertEqual(rule["cve"], "CVE-2025-58050")
+        self.assertEqual(rule["version_range"], ">=10.45,<10.46")
         condition_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
-        self.assertIn("pcre2_jit_builder_chain", condition_ids)
+        self.assertIn("pcre2_pattern_build", condition_ids)
+        self.assertIn("pcre2_match_use", condition_ids)
+        self.assertIn("pcre2_scan_substring_pattern", condition_ids)
+        any_of = next(cond for cond in rule["trigger_model"]["conditions"] if cond["id"] == "pcre2_match_use")
+        inner_ids = {cond["id"] for cond in any_of["conditions"]}
+        self.assertIn("pcre2_regex_captures", inner_ids)
 
     def test_auto_generated_libjpeg_rule_includes_wrapper_decode_sink(self):
         rule = generate_vulns_payload({"family": "libjpeg-turbo", "project": "reduce_image_size"})[0]
@@ -638,6 +659,61 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
         self.assertIn("rusqlite::Connection::query_row", sink_paths)
         self.assertIn("rusqlite::Connection::prepare", sink_paths)
+
+    def test_auto_generated_libxml2_rule_tracks_parser_wrapper_and_input(self):
+        rule = generate_vulns_payload({"family": "libxml2", "project": "fatoora-core"})[0]
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("Parser::parse_string", sink_paths)
+        cond_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("libxml2_parse_entry", cond_ids)
+        self.assertIn("libxml2_input", cond_ids)
+
+    def test_auto_generated_libwebp_rule_tracks_direct_and_wrapper_decode(self):
+        rule = generate_vulns_payload({"family": "libwebp", "project": "libwebp-image"})[0]
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("WebPDecodeRGBA", sink_paths)
+        self.assertIn("webp_load_rgba_from_memory", sink_paths)
+        cond_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("libwebp_decode_entry", cond_ids)
+        self.assertIn("libwebp_input", cond_ids)
+
+    def test_auto_generated_gdal_rule_tracks_dataset_open_and_input(self):
+        rule = generate_vulns_payload({"family": "gdal", "project": "gdal"})[0]
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("Dataset::open", sink_paths)
+        cond_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("gdal_dataset_entry", cond_ids)
+        self.assertIn("gdal_input", cond_ids)
+
+    def test_auto_generated_libarchive_rule_tracks_archive_iteration_and_input(self):
+        rule = generate_vulns_payload({"family": "libarchive", "project": "pacfiles"})[0]
+        self.assertEqual(rule["package"], "libarchive")
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("compress_tools::ArchiveIterator::from_read", sink_paths)
+        self.assertIn("compress_tools::uncompress_archive_file", sink_paths)
+        cond_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("libarchive_entry", cond_ids)
+        self.assertIn("libarchive_input", cond_ids)
+
+    def test_generic_auto_generated_family_rule_supports_curl(self):
+        self.assertTrue(can_auto_generate({"family": "curl"}))
+        rule = generate_vulns_payload({"family": "curl", "project": "downloader"})[0]
+        self.assertEqual(rule["package"], "curl")
+        self.assertEqual(rule["version_range"], ">=0")
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("Easy::perform", sink_paths)
+        cond_ids = {cond["id"] for cond in rule["trigger_model"]["conditions"]}
+        self.assertIn("curl_entry_any", cond_ids)
+        self.assertIn("curl_input", cond_ids)
+
+    def test_generic_auto_generated_family_rule_supports_libpng(self):
+        self.assertTrue(can_auto_generate({"family": "libpng"}))
+        rule = generate_vulns_payload({"family": "libpng", "project": "png-reader"})[0]
+        self.assertEqual(rule["package"], "libpng")
+        sink_paths = {sink["path"] for sink in rule["rust_sinks"]}
+        self.assertIn("png_image_begin_read_from_memory", sink_paths)
+        self.assertIn("png_image_finish_read", sink_paths)
+        self.assertEqual(rule["input_predicate"]["class"], "crafted_interlaced_16bit_png")
 
     def test_analyze_triggerability_requires_chain_nodes(self):
         trigger_model = {
@@ -712,6 +788,48 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         kind = map_result_kind("confirmed", True, assumptions)
         self.assertEqual(kind, "TriggerableWithInputAssumption")
 
+    def test_map_result_kind_prefers_manual_trigger_status(self):
+        self.assertEqual(
+            map_result_kind("confirmed", True, [], manual_status="observable_triggered"),
+            "ObservableTriggered",
+        )
+        self.assertEqual(
+            map_result_kind("confirmed", True, [], manual_status="path_triggered"),
+            "PathTriggered",
+        )
+
+    def test_manual_evidence_selection_and_application(self):
+        entries = [
+            {
+                "cve": "CVE-2023-4863",
+                "package": "libwebp",
+                "symbol": "WebPDecodeRGBA",
+                "status": "observable_triggered",
+                "summary": "ASan heap-buffer-overflow in VP8LBuildHuffmanTable",
+            }
+        ]
+        matched = select_manual_evidence(
+            entries,
+            cve="CVE-2023-4863",
+            package="libwebp-sys2",
+            symbol="WebPDecodeRGBA",
+        )
+        self.assertIsNotNone(matched)
+        entry = {
+            "reachable": True,
+            "triggerable": "possible",
+            "triggerable_internal": "possible",
+            "trigger_confidence": "medium",
+            "assumptions_used": [],
+            "evidence_notes": [],
+            "result_kind": "Reachable",
+        }
+        applied = apply_manual_evidence(entry, matched)
+        self.assertEqual(applied["manual_trigger_status"], "observable_triggered")
+        self.assertEqual(applied["triggerable"], "confirmed")
+        self.assertEqual(applied["result_kind"], "ObservableTriggered")
+        self.assertIn("Manual reproduction", applied["evidence_notes"][0])
+
     def test_summarize_guard_status_merges_trigger_and_env(self):
         trigger_hits = {
             "required_hits": [{"id": "a"}],
@@ -727,6 +845,295 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         self.assertIn("trigger:a", summary["satisfied_guards"])
         self.assertIn("trigger:b", summary["unresolved_guards"])
         self.assertIn("mitigation:m", summary["failed_guards"])
+
+    def test_cross_language_native_evidence_requires_native_side_signal_for_system_sources(self):
+        self.assertFalse(
+            has_cross_language_native_evidence(
+                source_status="system",
+                call_reachability_source="rust_call_package",
+                has_method=False,
+                strict_callsite_edges=0,
+                native_analysis_coverage="target_only",
+                native_dependency_imports=[],
+                strict_dependency_resolution={},
+            )
+        )
+        self.assertTrue(
+            has_cross_language_native_evidence(
+                source_status="system",
+                call_reachability_source="c_method",
+                has_method=True,
+                strict_callsite_edges=0,
+                native_analysis_coverage="target_only",
+                native_dependency_imports=[],
+                strict_dependency_resolution={},
+            )
+        )
+
+    def test_explicit_native_symbol_bridge_accepts_wrapper_symbol_mentions(self):
+        calls = [
+            {
+                "name": "parse_string",
+                "code": "let docptr = xmlReadMemory(input_ptr, input_len, url_ptr, encoding_ptr, options);",
+                "scope": "synthetic_package_method_code",
+            },
+            {
+                "name": "WebPDecodeRGBA",
+                "code": "let result = unsafe { sys::WebPDecodeRGBA(data.as_ptr(), data.len(), &mut width, &mut height) };",
+                "scope": "synthetic_package_method_code",
+            },
+        ]
+        self.assertTrue(has_explicit_native_symbol_bridge("xmlReadMemory", calls))
+        self.assertTrue(has_explicit_native_symbol_bridge("WebPDecodeRGBA", calls))
+        self.assertTrue(has_explicit_native_symbol_bridge("WebPDecode", calls))
+        self.assertFalse(has_explicit_native_symbol_bridge("pcre2_jit_compile_8", calls))
+
+    def test_native_symbol_name_match_allows_api_family_prefix(self):
+        self.assertTrue(_native_symbol_names_match("WebPDecode", "WebPDecodeRGBA"))
+        self.assertTrue(_native_symbol_names_match("WebPDecode", "WebPDecodeRGB"))
+        self.assertFalse(_native_symbol_names_match("WebPDecode", "WebPAnimDecoderGetNext"))
+
+    def test_explicit_native_symbol_bridge_rejects_generated_bindings_only(self):
+        calls = [
+            {
+                "name": "xmlReadMemory",
+                "code": "pub fn xmlReadMemory(",
+                "scope": "synthetic_source_text",
+                "file": "target_cpg_analysis/debug/build/libxml/out/bindings.rs",
+            }
+        ]
+        self.assertFalse(has_explicit_native_symbol_bridge("xmlReadMemory", calls))
+
+    def test_dependency_source_symbol_bridge_accepts_real_wrapper_source(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            crate_dir = root / "libxml-0.3.8"
+            src_dir = crate_dir / "src"
+            src_dir.mkdir(parents=True)
+            (crate_dir / "Cargo.toml").write_text('[package]\nname="libxml"\nversion="0.3.8"\n', encoding="utf-8")
+            (src_dir / "parser.rs").write_text(
+                "use crate::bindings::*;\nfn parse_string() { let _ = unsafe { xmlReadMemory(buf, len, url, enc, 0) }; }\n",
+                encoding="utf-8",
+            )
+            deps = {"packages": [{"name": "libxml", "manifest_path": str(crate_dir / 'Cargo.toml')}]}
+            self.assertTrue(has_dependency_source_symbol_bridge("xmlReadMemory", deps, ["libxml"]))
+
+    def test_collect_source_native_gateway_calls_skips_doc_comments(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "src"
+            src_dir.mkdir(parents=True)
+            (src_dir / "lib.rs").write_text(
+                "/// webp::WebPAnimDecoderGetNext(decoder, out, ts)\n"
+                "fn run(decoder: *mut u8) { unsafe { webp::WebPAnimDecoderGetNext(decoder.cast(), std::ptr::null_mut(), std::ptr::null_mut()); } }\n",
+                encoding="utf-8",
+            )
+            calls = collect_source_native_gateway_calls(str(root), ["webp"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["name"], "WebPAnimDecoderGetNext")
+
+    def test_collect_package_native_gateway_calls_extracts_code_window(self):
+        session = MagicMock()
+        session.run.return_value = [
+            {
+                "id": 7,
+                "name": "decode_image",
+                "code": (
+                    "fn decode_image(data: &[u8]) { let prefix = 1; let prefix2 = 2; "
+                    "let result = unsafe { webp::WebPDecodeRGBA(data.as_ptr(), data.len(), &mut w, &mut h) }; "
+                    "let suffix = prefix + prefix2; println!(\"{}\", suffix); }"
+                ),
+            }
+        ]
+        calls = collect_package_native_gateway_calls(session, "demo", ["webp"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "WebPDecodeRGBA")
+        self.assertIn("WebPDecodeRGBA", calls[0]["code"])
+        self.assertIsInstance(calls[0]["code"], str)
+
+    def test_has_transitive_native_symbol_bridge_uses_native_call_path(self):
+        session = MagicMock()
+        session.run.return_value.single.return_value = {"ok": 1}
+        self.assertTrue(
+            has_transitive_native_symbol_bridge(
+                session,
+                "libwebp",
+                ["WebPAnimDecoderGetNext"],
+                "WebPDecode",
+            )
+        )
+
+    def test_find_best_dep_chain_can_fall_back_to_matched_native_crate(self):
+        session = MagicMock()
+        session.run.return_value = [
+            {
+                "target": "libwebp-sys2",
+                "chain": ["ril", "image-rs", "libwebp-sys2"],
+                "edges": [
+                    {"from": "ril", "to": "image-rs", "type": "DEPENDS_ON"},
+                    {"from": "image-rs", "to": "libwebp-sys2", "type": "DEPENDS_ON"},
+                ],
+            }
+        ]
+        match = find_best_dep_chain(
+            session,
+            "ril",
+            "libwebp",
+            native_component_instances=[
+                {
+                    "matched_crates": [
+                        {"crate": "libwebp-sys2"},
+                    ]
+                }
+            ],
+        )
+        self.assertEqual(match["target"], "libwebp-sys2")
+        self.assertEqual(match["chain"][-1], "libwebp-sys2")
+        kwargs = session.run.call_args.kwargs
+        self.assertIn("libwebp", kwargs["pkg_names"])
+        self.assertIn("libwebp-sys2", kwargs["pkg_names"])
+
+    def test_select_relevant_native_gateway_calls_prefers_real_decode_over_cleanup(self):
+        calls = [
+            {
+                "id": "clear",
+                "name": "WebPDataClear",
+                "code": "unsafe { libwebp::WebPDataClear(&mut data) }",
+                "method": "cleanup",
+                "scope": "synthetic_native_gateway_source",
+                "line": 10,
+            },
+            {
+                "id": "decode",
+                "name": "WebPDecodeRGBA",
+                "code": "unsafe { libwebp::WebPDecodeRGBA(ptr, len, &mut w, &mut h) }",
+                "method": "decode_frame",
+                "scope": "synthetic_native_gateway_source",
+                "line": 200,
+            },
+            {
+                "id": "delete",
+                "name": "WebPMuxDelete",
+                "code": "unsafe { libwebp::WebPMuxDelete(mux) }",
+                "method": "cleanup",
+                "scope": "synthetic_native_gateway_source",
+                "line": 20,
+            },
+        ]
+        selected = select_relevant_native_gateway_calls(
+            calls,
+            symbol="WebPDecode",
+            sink_candidates=[{"path": "webp::Decoder::decode"}],
+            limit=1,
+        )
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["name"], "WebPDecodeRGBA")
+
+    def test_select_relevant_native_gateway_calls_beats_generic_next_over_new(self):
+        calls = [
+            {
+                "id": "new",
+                "name": "WebPAnimDecoderNew",
+                "code": "unsafe { webp::WebPAnimDecoderNew(data, &opts) }",
+                "method": "run_decoder",
+                "scope": "synthetic_native_gateway_source",
+                "line": 193,
+            },
+            {
+                "id": "next",
+                "name": "WebPAnimDecoderGetNext",
+                "code": "unsafe { webp::WebPAnimDecoderGetNext(decoder, &mut buf, &mut ts) }",
+                "method": "run_decoder",
+                "scope": "synthetic_native_gateway_source",
+                "line": 245,
+            },
+        ]
+        selected = select_relevant_native_gateway_calls(calls, symbol="VP8LBuildHuffmanTable", limit=1)
+        self.assertEqual(selected[0]["name"], "WebPAnimDecoderGetNext")
+
+    def test_maybe_collect_expanded_feature_deps_uses_all_features_when_root_has_optional_deps(self):
+        meta = {
+            "packages": [
+                {
+                    "id": "pkg",
+                    "name": "demo",
+                    "features": {"webp": ["dep:libwebp-sys2"]},
+                    "dependencies": [{"name": "libwebp-sys2", "optional": True}],
+                }
+            ],
+            "workspace_default_members": ["pkg"],
+            "resolve": {"nodes": [{"id": "pkg", "features": []}]},
+        }
+        expanded_meta = {
+            "packages": [
+                {
+                    "id": "pkg",
+                    "name": "demo",
+                    "version": "0.1.0",
+                    "manifest_path": "/tmp/demo/Cargo.toml",
+                },
+                {
+                    "id": "dep",
+                    "name": "libwebp-sys2",
+                    "version": "0.1.11",
+                    "manifest_path": "/tmp/libwebp-sys2/Cargo.toml",
+                },
+            ],
+            "workspace_default_members": ["pkg"],
+            "resolve": {
+                "nodes": [
+                    {"id": "pkg", "features": ["webp"], "deps": [{"pkg": "dep"}]},
+                    {"id": "dep", "features": ["1_2"], "deps": []},
+                ]
+            },
+        }
+        with patch("tools.supplychain.supplychain_analyze.run_metadata", return_value=expanded_meta):
+            result = maybe_collect_expanded_feature_deps("/tmp/demo", meta)
+        self.assertIsNotNone(result)
+        dep_names = {pkg["name"] for pkg in result["deps"]["packages"]}
+        self.assertIn("libwebp-sys2", dep_names)
+
+    def test_filter_speculative_source_features_keeps_functional_features_only(self):
+        deps = {
+            "packages": [
+                {"name": "libwebp-sys2", "features": ["demux", "mux", "static"]},
+            ]
+        }
+        _filter_speculative_source_features(deps, {"libwebp-sys2": []})
+        self.assertEqual(deps["packages"][0]["features"], ["demux", "mux"])
+
+    def test_resolve_native_component_instances_matches_sys_suffix_variants_and_probes_system(self):
+        with TemporaryDirectory() as tmp:
+            crate_dir = Path(tmp) / "libwebp-sys2"
+            crate_dir.mkdir(parents=True, exist_ok=True)
+            manifest = crate_dir / "Cargo.toml"
+            manifest.write_text("[package]\nname='libwebp-sys2'\nversion='0.1.11'\n", encoding="utf-8")
+            (crate_dir / "build.rs").write_text(
+                "fn main(){ let _ = pkg_config::probe_library(\"libwebp\"); }",
+                encoding="utf-8",
+            )
+            metadata = {
+                "libwebp-sys2": {
+                    "versions": ["0.1.11"],
+                    "sources": ["cargo"],
+                    "features": ["demux"],
+                    "langs": ["Rust"],
+                    "crate_sources": [],
+                    "manifest_paths": [str(manifest)],
+                }
+            }
+            vuln = {"package": "libwebp", "match": {"crates": ["webp", "libwebp-sys"]}}
+            _SYSTEM_NATIVE_VERSION_CACHE.clear()
+            with patch("tools.supplychain.supplychain_analyze.subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "1.2.4\n"
+                mock_run.return_value.stderr = ""
+                instances = resolve_native_component_instances(vuln, metadata, cargo_dir=tmp)
+            self.assertTrue(instances)
+            self.assertEqual(instances[0]["source"], "system")
+            self.assertEqual(instances[0]["resolved_version"], "1.2.4")
+            crates = [row["crate"] for row in instances[0]["matched_crates"]]
+            self.assertIn("libwebp-sys2", crates)
 
     def test_apply_sink_knowledge_fills_missing_sinks(self):
         vuln = {"package": "libwebp", "cve": "CVE-T"}
@@ -766,6 +1173,49 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
             self.assertTrue(instances)
             self.assertEqual(instances[0]["source"], "bundled")
             self.assertIn("vendored-libgit2", instances[0]["enabled_features"])
+
+    def test_resolve_native_component_instances_falls_back_to_build_version_when_system_probe_missing(self):
+        with TemporaryDirectory() as tmp:
+            crate_dir = Path(tmp) / "gdal-sys"
+            crate_dir.mkdir(parents=True, exist_ok=True)
+            manifest = crate_dir / "Cargo.toml"
+            manifest.write_text("[package]\nname='gdal-sys'\nversion='0.12.0'\n", encoding="utf-8")
+            (crate_dir / "build.rs").write_text(
+                "\n".join(
+                    [
+                        "fn main() {",
+                        "    let native = \"3.4.0\";",
+                        "    println!(\"cargo:warning={}\", native);",
+                        "    let _ = pkg_config::probe_library(\"gdal\");",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            metadata = {
+                "gdal": {
+                    "versions": ["0.19.0"],
+                    "sources": ["cargo"],
+                    "features": ["default"],
+                    "langs": ["Rust"],
+                    "crate_sources": [],
+                    "manifest_paths": [str(Path(tmp) / "gdal" / "Cargo.toml")],
+                },
+                "gdal-sys": {
+                    "versions": ["0.12.0"],
+                    "sources": ["cargo"],
+                    "features": ["default"],
+                    "langs": ["Rust"],
+                    "crate_sources": [],
+                    "manifest_paths": [str(manifest)],
+                },
+            }
+            vuln = {"package": "gdal", "match": {"crates": ["gdal-sys"]}}
+            with patch("tools.supplychain.supplychain_analyze._probe_system_native_version", return_value=None):
+                instances = resolve_native_component_instances(vuln, metadata, cargo_dir=tmp)
+            self.assertTrue(instances)
+            self.assertEqual(instances[0]["source"], "system")
+            self.assertEqual(instances[0]["resolved_version"], "3.4.0")
 
     def test_resolve_native_component_instances_prefers_system_openssl_version_probe(self):
         with TemporaryDirectory() as tmp:
@@ -909,7 +1359,7 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         evidence_kinds = [item.get("kind") for item in instances[0]["resolution_evidence"]]
         self.assertIn("system_probe", evidence_kinds)
 
-    def test_auto_vuln_inputs_support_openh264_freetype_and_zlib(self):
+    def test_auto_vuln_inputs_support_openh264_freetype_zlib_and_libarchive(self):
         openh264_item = {
             "family": "openh264",
             "project": "demo-video",
@@ -928,12 +1378,20 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
             "cve": "CVE-2022-37434",
             "dependency_evidence": [{"crate": "libz-sys"}],
         }
+        libarchive_item = {
+            "family": "libarchive",
+            "project": "demo-archive",
+            "cve": "LIBARCHIVE-2025-FAMILY",
+            "dependency_evidence": [{"crate": "compress-tools"}],
+        }
         self.assertTrue(can_auto_generate(openh264_item))
         self.assertTrue(can_auto_generate(freetype_item))
         self.assertTrue(can_auto_generate(zlib_item))
+        self.assertTrue(can_auto_generate(libarchive_item))
         openh264_rule = generate_vulns_payload(openh264_item)[0]
         freetype_rule = generate_vulns_payload(freetype_item)[0]
         zlib_rule = generate_vulns_payload(zlib_item)[0]
+        libarchive_rule = generate_vulns_payload(libarchive_item)[0]
         self.assertEqual(openh264_rule["package"], "openh264-sys2")
         self.assertEqual(openh264_rule["symbols"], ["WelsDecodeBs"])
         self.assertEqual(freetype_rule["package"], "freetype")
@@ -942,6 +1400,8 @@ class RuleNormalizationAndResultTests(unittest.TestCase):
         self.assertEqual(zlib_rule["package"], "zlib")
         self.assertEqual(zlib_rule["version_range"], "<1.2.13")
         self.assertIn("inflateGetHeader", zlib_rule["symbols"])
+        self.assertEqual(libarchive_rule["package"], "libarchive")
+        self.assertIn("archive_read_next_header", libarchive_rule["symbols"])
 
     def test_evaluate_input_predicate_can_prune_non_target_type(self):
         rule = {

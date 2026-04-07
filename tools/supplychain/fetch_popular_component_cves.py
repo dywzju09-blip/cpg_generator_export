@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
-import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -22,9 +25,18 @@ from tools.supplychain.vuln_db_seed import COMPONENTS, VULNERABILITIES
 
 API_BASE = "https://cve.circl.lu/api/search/{vendor}/{product}?page={page}"
 DEFAULT_OUT = REPO_ROOT / "Data" / "vuln_db" / "catalog" / "auto_cves_2021_2026.json"
-PUB_START = datetime.fromisoformat("2021-01-01T00:00:00")
-MAX_PER_COMPONENT = 40
-TARGET_TOTAL = 200
+PUB_START = datetime.fromisoformat("2015-01-01T00:00:00")
+MAX_PER_COMPONENT = 50
+MAX_PAGES_PER_COMPONENT = 5
+TARGET_TOTAL = 240
+REQUEST_TIMEOUT_SEC = 20
+REQUEST_RETRIES = 3
+REQUEST_RETRY_BACKOFF_SEC = 1.5
+MAX_COMPONENT_WORKERS = 8
+REQUEST_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "cpg-generator-export/fetch-popular-component-cves",
+}
 NON_SYMBOL_WORDS = {
     "Request",
     "Response",
@@ -37,12 +49,12 @@ NON_SYMBOL_WORDS = {
 
 
 COMPONENT_QUERY_CANDIDATES = {
-    "libxml2": [("gnome", "libxml2")],
+    "libxml2": [("xmlsoft", "libxml2"), ("xmlsoft", "libxml"), ("gnome", "libxml2")],
     "expat": [("libexpat", "expat"), ("expat", "expat")],
     "zlib": [("zlib", "zlib")],
-    "libwebp": [("google", "libwebp"), ("webmproject", "libwebp")],
+    "libwebp": [("webmproject", "libwebp"), ("google", "libwebp")],
     "libgit2": [("libgit2", "libgit2")],
-    "sqlite": [("sqlite", "sqlite")],
+    "sqlite": [("sqlite", "sqlite"), ("sqlite", "sqlite3")],
     "pcre2": [("pcre", "pcre2")],
     "openssl": [("openssl", "openssl")],
     "openh264": [("cisco", "openh264")],
@@ -52,7 +64,7 @@ COMPONENT_QUERY_CANDIDATES = {
     "gstreamer": [("gstreamer", "gstreamer")],
     "libjpeg-turbo": [("libjpeg-turbo", "libjpeg-turbo")],
     "cjson": [("davegamble", "cjson"), ("cjson", "cjson")],
-    "libpng": [("pnggroup", "libpng"), ("libpng", "libpng")],
+    "libpng": [("libpng", "libpng"), ("pnggroup", "libpng")],
     "libtiff": [("libtiff", "libtiff")],
     "curl": [("curl", "curl")],
     "libarchive": [("libarchive", "libarchive")],
@@ -67,7 +79,74 @@ COMPONENT_QUERY_CANDIDATES = {
     "brotli": [("google", "brotli"), ("brotli", "brotli")],
     "libyaml": [("libyaml", "libyaml")],
     "libraw": [("libraw", "libraw")],
+    "zstd": [("facebook", "zstd"), ("zstd", "zstd")],
+    "bzip2": [("bzip2", "bzip2"), ("bzip", "bzip2")],
+    "libuv": [("libuv", "libuv")],
+    "libevent": [("libevent", "libevent")],
+    "libsodium": [("jedisct1", "libsodium"), ("libsodium", "libsodium")],
+    "nghttp2": [("nghttp2", "nghttp2")],
+    "c-ares": [("c-ares", "c-ares"), ("c-ares", "cares")],
+    "oniguruma": [("kkos", "oniguruma"), ("oniguruma", "oniguruma")],
+    "libusb": [("libusb", "libusb"), ("libusb", "libusb-1.0")],
+    "openjpeg": [("uclouvain", "openjpeg"), ("openjpeg", "openjpeg")],
+    "openexr": [("openexr", "openexr"), ("academysoftwarefoundation", "openexr")],
+    "libavif": [("aomedia", "libavif"), ("libavif", "libavif")],
+    "yara": [("virustotal", "yara"), ("yara", "yara")],
+    "libmagic": [("file", "file"), ("libmagic", "libmagic")],
+    "wolfssl": [("wolfssl", "wolfssl")],
+    "nettle": [("gnu", "nettle"), ("nettle", "nettle")],
+    "krb5": [("mit", "krb5"), ("mit", "kerberos_5")],
+    "ncurses": [("gnu", "ncurses"), ("ncurses", "ncurses")],
+    "jansson": [("jansson", "jansson")],
+    "giflib": [("giflib", "giflib")],
 }
+
+HIGH_VOLUME_COMPONENT_PRIORITY = [
+    "ffmpeg",
+    "gstreamer",
+    "openjpeg",
+    "openexr",
+    "yara",
+    "krb5",
+    "zstd",
+    "freetype",
+    "libxml2",
+    "sqlite",
+    "libarchive",
+    "openssl",
+    "curl",
+    "libtiff",
+    "libpng",
+    "libraw",
+    "libwebp",
+    "libgit2",
+    "pcre2",
+    "gdal",
+    "libheif",
+    "libjpeg-turbo",
+    "libssh2",
+    "libzip",
+    "libvpx",
+    "libaom",
+    "libsodium",
+    "nghttp2",
+    "libevent",
+    "libuv",
+    "oniguruma",
+    "libusb",
+    "libavif",
+    "libmagic",
+    "wolfssl",
+    "nettle",
+    "c-ares",
+    "bzip2",
+    "ncurses",
+    "jansson",
+    "giflib",
+    "xz",
+    "zlib",
+    "expat",
+]
 
 
 def component_index() -> dict[str, dict]:
@@ -79,16 +158,23 @@ def existing_manual_keys() -> set[tuple[str, str]]:
 
 
 def curl_json(url: str) -> dict[str, Any]:
-    proc = subprocess.run(
-        ["curl", "-L", url],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    text = proc.stdout.strip()
-    if not text:
-        return {}
-    return json.loads(text)
+    request = urllib.request.Request(url, headers=REQUEST_HEADERS)
+    last_error: Exception | None = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SEC) as response:
+                text = response.read().decode("utf-8", errors="replace").strip()
+            if not text:
+                raise ValueError("empty response body")
+            return json.loads(text)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt >= REQUEST_RETRIES:
+                break
+            time.sleep(REQUEST_RETRY_BACKOFF_SEC * attempt)
+    if last_error:
+        raise last_error
+    return {}
 
 
 def parse_published(record: dict) -> datetime | None:
@@ -338,8 +424,22 @@ def source_pairs(record: dict) -> dict:
     }
 
 
-def fetch_component_records(component_name: str) -> list[dict]:
+def ordered_components(selected_components: list[str] | None = None) -> list[str]:
+    if selected_components:
+        return list(selected_components)
+    available = list(component_index().keys())
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in HIGH_VOLUME_COMPONENT_PRIORITY + available:
+        if name in available and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def fetch_component_records(component_name: str, *, verbose: bool = False) -> list[dict]:
     candidates = COMPONENT_QUERY_CANDIDATES.get(component_name) or []
+    best_by_cve: dict[str, dict] = {}
     for vendor, product in candidates:
         try:
             first = curl_json(API_BASE.format(vendor=vendor, product=product, page=1))
@@ -348,30 +448,57 @@ def fetch_component_records(component_name: str) -> list[dict]:
         total = int(first.get("total_count") or 0)
         if total <= 0:
             continue
-        pages = max(1, min(5, (total + 9) // 10))
-        records = []
-        records.extend(select_source_record(first))
+        pages = max(1, min(MAX_PAGES_PER_COMPONENT, (total + 9) // 10))
+        records = list(select_source_record(first))
         for page in range(2, pages + 1):
             try:
                 data = curl_json(API_BASE.format(vendor=vendor, product=product, page=page))
             except Exception:
                 break
             records.extend(select_source_record(data))
-        return records
-    return []
+        if verbose:
+            print(
+                f"[query] {component_name}: {vendor}/{product} total_count={total} pages={pages} selected={len(records)}",
+                file=sys.stderr,
+            )
+        for record in records:
+            cve = record_cve_id(record)
+            if not cve or cve in best_by_cve:
+                continue
+            best_by_cve[cve] = record
+            if len(best_by_cve) >= MAX_PER_COMPONENT:
+                break
+        if len(best_by_cve) >= MAX_PER_COMPONENT:
+            break
+    return list(best_by_cve.values())
 
 
 def build_auto_entries(target_total: int, selected_components: list[str] | None = None, verbose: bool = False) -> list[dict]:
     comp_map = component_index()
     manual_keys = existing_manual_keys()
     per_component: dict[str, list[dict]] = defaultdict(list)
-    component_names = selected_components or list(comp_map.keys())
+    component_names = ordered_components(selected_components)
     seen_keys: set[tuple[str, str]] = set()
+    fetch_results: dict[str, list[dict]] = {}
+
+    eligible_components = [component_name for component_name in component_names if component_name in comp_map]
+    max_workers = max(1, min(MAX_COMPONENT_WORKERS, len(eligible_components)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(fetch_component_records, component_name, verbose=verbose): component_name
+            for component_name in eligible_components
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            component_name = future_map[future]
+            try:
+                fetch_results[component_name] = future.result()
+            except Exception:
+                fetch_results[component_name] = []
 
     for component_name in component_names:
         if component_name not in comp_map:
             continue
-        records = fetch_component_records(component_name)
+        records = fetch_results.get(component_name) or []
         if verbose:
             print(f"[fetch] {component_name}: records={len(records)}", file=sys.stderr)
         for record in records:
@@ -464,6 +591,7 @@ def main() -> None:
         "schema_version": 1,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "source": "https://cve.circl.lu/api/search/{vendor}/{product}",
+        "publication_start": PUB_START.isoformat(),
         "target_total": args.target_total,
         "manual_total": manual_total,
         "target_auto_total": auto_target,

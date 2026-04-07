@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use rust_cpg_generator::CpgCompilerCallbacks;
 use rust_cpg_generator::cpg::nodes::CpgGraph;
 use std::process::Command;
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -90,7 +89,7 @@ fn main() {
             Err(e) => eprintln!("Failed to create output file: {}", e),
         }
     } else {
-        eprintln!("Analysis failed with exit code {}", exit_code);
-        std::process::exit(exit_code);
+        eprintln!("Analysis failed with exit code {:?}", exit_code);
+        std::process::exit(1);
     }
 }

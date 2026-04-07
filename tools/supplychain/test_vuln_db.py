@@ -14,11 +14,11 @@ class VulnDbTests(unittest.TestCase):
     def test_runtime_rules_manifest_counts_match(self):
         manifest = json.loads(default_manifest_path().read_text(encoding="utf-8"))
         rules = json.loads(default_runtime_rules_path().read_text(encoding="utf-8"))
-        self.assertEqual(manifest["component_count"], 30)
-        self.assertGreaterEqual(manifest["vulnerability_count"], 200)
+        self.assertGreaterEqual(manifest["component_count"], 50)
+        self.assertGreaterEqual(manifest["vulnerability_count"], 450)
         self.assertEqual(len(rules), manifest["vulnerability_count"])
         self.assertEqual(manifest["curated_vulnerability_count"], manifest["vulnerability_count"])
-        self.assertEqual(manifest["manual_vulnerability_count"], 30)
+        self.assertGreaterEqual(manifest["manual_vulnerability_count"], 30)
         self.assertTrue(all(rule.get("maturity") == "curated" for rule in rules))
 
     def test_rules_include_structured_version_info(self):

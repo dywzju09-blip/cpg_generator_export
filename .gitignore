@@ -37,3 +37,4 @@ cpg_export/
 
 # Temporary files
 *.log
+.installation_root

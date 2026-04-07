@@ -8,6 +8,7 @@ import re
 import sys
 import subprocess
 import hashlib
+from pathlib import Path
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, "..", ".."))
@@ -50,13 +51,17 @@ except Exception:
 try:
     from tools.fetch.native_source_resolver import (
         choose_c_analysis_scope,
+        choose_c_analysis_scope_from_relative_paths,
         ensure_native_source_tree,
+        find_symbol_definition_files,
         find_symbol_source_files,
         infer_native_source_dependencies,
     )
 except Exception:
     choose_c_analysis_scope = None
+    choose_c_analysis_scope_from_relative_paths = None
     ensure_native_source_tree = None
+    find_symbol_definition_files = None
     find_symbol_source_files = None
     infer_native_source_dependencies = None
 
@@ -145,6 +150,24 @@ def load_json(path):
     with open(path, "r") as f:
         return json.load(f)
 
+
+def load_manual_evidence(path):
+    if not path:
+        return []
+    try:
+        payload = load_json(path)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        entries = payload.get("entries") or payload.get("items") or [payload]
+    else:
+        entries = []
+    return [item for item in entries if isinstance(item, dict)]
+
 def _split_feature_list(text):
     items = []
     seen = set()
@@ -160,6 +183,192 @@ def _split_feature_list(text):
     return items
 
 
+def _normalize_native_crate_name(name):
+    text = str(name or "").strip().lower().replace("_", "-")
+    if not text:
+        return ""
+    text = re.sub(r"-(sys|src|bindings)\d*$", "", text)
+    text = re.sub(r"-(ffi)\d*$", "", text)
+    return text
+
+
+def _candidate_native_crate_aliases(name):
+    raw = str(name or "").strip()
+    if not raw:
+        return []
+    norm = raw.lower().replace("_", "-")
+    out = [norm]
+    out.append(_normalize_native_crate_name(norm))
+    underscored = norm.replace("-", "_")
+    out.append(underscored)
+    out.append(_normalize_native_crate_name(norm).replace("-", "_"))
+    base = _normalize_native_crate_name(norm)
+    if base.startswith("lib") and len(base) > 3:
+        short = base[3:]
+        out.extend([short, short.replace("-", "_")])
+    return list(dict.fromkeys([item for item in out if item]))
+
+
+def _root_package_has_feature_variants(meta):
+    root_pkg = _metadata_root_package(meta)
+    if not root_pkg:
+        return False
+    if root_pkg.get("features"):
+        return True
+    for dep in root_pkg.get("dependencies") or []:
+        if dep.get("optional"):
+            return True
+    return False
+
+
+def maybe_collect_expanded_feature_deps(cargo_dir, meta, *, cargo_features="", cargo_all_features=False, cargo_no_default_features=False):
+    if cargo_all_features or cargo_no_default_features:
+        return None
+    if not _root_package_has_feature_variants(meta):
+        return None
+    try:
+        expanded_meta = run_metadata(
+            cargo_dir,
+            cargo_features=cargo_features,
+            cargo_all_features=True,
+            cargo_no_default_features=False,
+        )
+    except Exception:
+        return None
+    return {
+        "meta": expanded_meta,
+        "deps": build_deps_from_cargo(expanded_meta),
+        "root_enabled_features": _metadata_enabled_features(
+            expanded_meta,
+            (_metadata_root_package(expanded_meta) or {}).get("id"),
+        ),
+    }
+
+
+def _analysis_base_env(base_env=None):
+    env = dict(base_env or os.environ)
+    env.setdefault("RUSTUP_TOOLCHAIN", "stable")
+
+    toolchain_name = env.get("RUSTUP_TOOLCHAIN") or "stable"
+    toolchain_lib = os.path.expanduser(f"~/.rustup/toolchains/{toolchain_name}-x86_64-unknown-linux-gnu/lib")
+    linker_candidates = []
+    if os.path.isdir(toolchain_lib):
+        linker_candidates.append(toolchain_lib)
+
+    gcc_runtime_globs = [
+        "/usr/lib/gcc/x86_64-linux-gnu/*",
+        "/usr/lib/gcc/*/*",
+    ]
+    for pattern in gcc_runtime_globs:
+        for candidate in sorted(glob.glob(pattern), reverse=True):
+            if os.path.isdir(candidate):
+                linker_candidates.append(candidate)
+                break
+
+    for candidate in [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/lib",
+    ]:
+        if os.path.isdir(candidate):
+            linker_candidates.append(candidate)
+
+    dedup_linker = []
+    for candidate in linker_candidates:
+        if candidate and candidate not in dedup_linker:
+            dedup_linker.append(candidate)
+
+    existing_library = [p for p in str(env.get("LIBRARY_PATH") or "").split(":") if p]
+    merged_library = []
+    # Preserve caller-provided library search paths ahead of system defaults.
+    for candidate in existing_library + dedup_linker:
+        if candidate and candidate not in merged_library and os.path.isdir(candidate):
+            merged_library.append(candidate)
+    if merged_library:
+        env["LIBRARY_PATH"] = ":".join(merged_library)
+
+    existing_ld = [p for p in str(env.get("LD_LIBRARY_PATH") or "").split(":") if p]
+    merged_ld = []
+    for candidate in existing_ld + dedup_linker:
+        if candidate and candidate not in merged_ld and os.path.isdir(candidate):
+            merged_ld.append(candidate)
+    if merged_ld:
+        env["LD_LIBRARY_PATH"] = ":".join(merged_ld)
+
+    rustflag_parts = [part for part in str(env.get("RUSTFLAGS") or "").split() if part]
+    # for candidate in merged_library:
+    #     token = f"native={candidate}"
+    #     if token in rustflag_parts:
+    #         continue
+    #     rustflag_parts.extend(["-L", token])
+    # if rustflag_parts:
+    #     env["RUSTFLAGS"] = " ".join(rustflag_parts)
+
+    pkg_config_candidates = [
+        "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        "/usr/lib/pkgconfig",
+        "/usr/share/pkgconfig",
+    ]
+    existing_pkg = [p for p in str(env.get("PKG_CONFIG_PATH") or "").split(":") if p]
+    merged_pkg = []
+    # Preserve caller-provided pkg-config roots ahead of system pkg-config roots.
+    for candidate in existing_pkg + pkg_config_candidates:
+        if candidate and candidate not in merged_pkg and os.path.isdir(candidate):
+            merged_pkg.append(candidate)
+    if merged_pkg:
+        env["PKG_CONFIG_PATH"] = ":".join(merged_pkg)
+
+    cmake_candidates = [p for p in ["/usr", "/usr/local"] if os.path.isdir(p)]
+    existing_cmake = [p for p in str(env.get("CMAKE_PREFIX_PATH") or "").split(":") if p]
+    merged_cmake = []
+    for candidate in existing_cmake + cmake_candidates:
+        if candidate and candidate not in merged_cmake:
+            merged_cmake.append(candidate)
+    if merged_cmake:
+        env["CMAKE_PREFIX_PATH"] = ":".join(merged_cmake)
+
+    llvm_config_candidates = [
+        "/usr/bin/llvm-config",
+        "/usr/bin/llvm-config-18",
+        "/usr/bin/llvm-config-14",
+        "/usr/lib/llvm-18/bin/llvm-config",
+        "/usr/lib/llvm-14/bin/llvm-config",
+    ]
+    if not str(env.get("LLVM_CONFIG_PATH") or "").strip():
+        for candidate in llvm_config_candidates:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                env["LLVM_CONFIG_PATH"] = candidate
+                break
+
+    libclang_candidates = [
+        "/usr/lib/llvm-18/lib",
+        "/usr/lib/llvm-14/lib",
+        "/usr/lib/x86_64-linux-gnu",
+    ]
+    if not str(env.get("LIBCLANG_PATH") or "").strip():
+        for candidate in libclang_candidates:
+            if os.path.isdir(candidate):
+                env["LIBCLANG_PATH"] = candidate
+                break
+
+    llvm_bin_candidates = [
+        "/usr/lib/llvm-18/bin",
+        "/usr/lib/llvm-14/bin",
+    ]
+    existing_path = [p for p in str(env.get("PATH") or "").split(":") if p]
+    merged_path = []
+    for candidate in existing_path + llvm_bin_candidates:
+        if candidate and candidate not in merged_path and os.path.isdir(candidate):
+            merged_path.append(candidate)
+    if merged_path:
+        env["PATH"] = ":".join(merged_path)
+
+    return env
+
+
 def run_metadata(cargo_dir, cargo_features="", cargo_all_features=False, cargo_no_default_features=False):
     cmd = ["cargo", "metadata", "--format-version", "1"]
     if cargo_all_features:
@@ -170,7 +379,7 @@ def run_metadata(cargo_dir, cargo_features="", cargo_all_features=False, cargo_n
             cmd.extend(["--features", ",".join(feature_items)])
     if cargo_no_default_features:
         cmd.append("--no-default-features")
-    res = subprocess.run(cmd, cwd=cargo_dir, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=cargo_dir, env=_analysis_base_env(), capture_output=True, text=True)
     if res.returncode != 0:
         print(res.stderr)
         raise RuntimeError("cargo metadata failed")
@@ -188,6 +397,65 @@ def _run_cmd(cmd, cwd=None, env=None, label="command"):
     return res
 
 
+def _safe_is_relative_to(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _placeholder_text_for_path(path):
+    suffix = str(Path(path).suffix or "").lower()
+    if suffix == ".css":
+        return "/* analysis placeholder */\n"
+    if suffix in {".json", ".ron"}:
+        return "{}\n"
+    if suffix in {".toml"}:
+        return "# analysis placeholder\n"
+    return "analysis placeholder\n"
+
+
+def _extract_missing_include_paths(stderr_text, cargo_dir):
+    missing = []
+    cargo_root = Path(cargo_dir).resolve()
+    for match in re.finditer(r"couldn't read `([^`]+)`", str(stderr_text or "")):
+        raw_path = match.group(1).strip()
+        if not raw_path:
+            continue
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = cargo_root / candidate
+        candidate = candidate.resolve()
+        if candidate.exists():
+            continue
+        if not _safe_is_relative_to(candidate, cargo_root):
+            continue
+        missing.append(candidate)
+    unique = []
+    seen = set()
+    for path in missing:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _create_placeholder_include_files(paths):
+    created = []
+    for path in paths:
+        try:
+            if path.exists():
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_placeholder_text_for_path(path), encoding="utf-8")
+            created.append(str(path))
+        except Exception:
+            continue
+    return created
+
+
 def _build_cargo_feature_args(cargo_features="", cargo_all_features=False, cargo_no_default_features=False):
     args = []
     if cargo_all_features:
@@ -199,6 +467,69 @@ def _build_cargo_feature_args(cargo_features="", cargo_all_features=False, cargo
     if cargo_no_default_features:
         args.append("--no-default-features")
     return args
+
+
+def _extract_out_dir_relpaths_from_text(text):
+    if 'env!("OUT_DIR")' not in text:
+        return []
+    rels = []
+    for match in re.finditer(r'env!\("OUT_DIR"\)\s*,\s*"(/[^"]+)"', text):
+        rels.append(match.group(1).lstrip("/"))
+    return list(dict.fromkeys([r for r in rels if r]))
+
+
+def _extract_out_dir_relpaths(input_file):
+    try:
+        text = open(input_file, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return []
+    return _extract_out_dir_relpaths_from_text(text)
+
+
+def _extract_out_dir_relpaths_from_crate(cargo_dir, input_file, max_files=400):
+    rels = _extract_out_dir_relpaths(input_file)
+    src_root = Path(cargo_dir) / "src"
+    if not src_root.exists():
+        return rels
+    scanned = 0
+    for path in src_root.rglob("*.rs"):
+        if scanned >= max_files:
+            break
+        scanned += 1
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        rels.extend(_extract_out_dir_relpaths_from_text(text))
+    return list(dict.fromkeys([r for r in rels if r]))
+
+
+def _find_generator_out_dir(input_file, target_dir, cargo_dir=""):
+    rels = _extract_out_dir_relpaths_from_crate(cargo_dir, input_file) if cargo_dir else _extract_out_dir_relpaths(input_file)
+    build_root = os.path.join(target_dir, "debug", "build")
+    if not os.path.isdir(build_root):
+        return ""
+
+    out_dirs = []
+    for base, dirnames, _ in os.walk(build_root):
+        if os.path.basename(base) == "out":
+            out_dirs.append(base)
+    if not out_dirs:
+        return ""
+
+    if rels:
+        matches = []
+        for out_dir in out_dirs:
+            if all(os.path.exists(os.path.join(out_dir, rel)) for rel in rels):
+                matches.append(out_dir)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            return sorted(matches, key=len)[0]
+
+    if len(out_dirs) == 1:
+        return out_dirs[0]
+    return ""
 
 
 def _metadata_root_package(meta):
@@ -252,16 +583,95 @@ def _pick_rust_input_file(meta, cargo_dir, explicit_input="", prefer_main=True):
     return src_path
 
 
-def _collect_extern_rlibs(deps_dir):
+def _collect_extern_artifacts(deps_dir):
     externs = {}
-    for rlib in sorted(glob.glob(os.path.join(deps_dir, "lib*.rlib"))):
-        base = os.path.basename(rlib)
-        name = base[3:]
-        if "-" in name:
-            name = name.split("-", 1)[0]
-        if name not in externs:
-            externs[name] = rlib
+    patterns = ["lib*.rlib", "lib*.so", "lib*.dylib"]
+    for pattern in patterns:
+        for artifact in sorted(glob.glob(os.path.join(deps_dir, pattern))):
+            base = os.path.basename(artifact)
+            name = base[3:]
+            if "." in name:
+                name = name.split(".", 1)[0]
+            if "-" in name:
+                name = name.split("-", 1)[0]
+            if name not in externs:
+                externs[name] = artifact
     return externs
+
+
+def _normalize_crate_ident(name):
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    text = text.replace("-", "_")
+    text = re.sub(r"[^A-Za-z0-9_]", "_", text)
+    return text
+
+
+def _collect_dependency_rename_externs(meta, root_pkg, extern_artifacts):
+    rename_map = {}
+    if not isinstance(root_pkg, dict):
+        return rename_map
+
+    pkg_rows = list((meta or {}).get("packages") or [])
+    by_name = {}
+    for pkg in pkg_rows:
+        name = str(pkg.get("name") or "").strip()
+        if not name:
+            continue
+        by_name.setdefault(name, []).append(pkg)
+
+    for dep in root_pkg.get("dependencies") or []:
+        dep_name = str(dep.get("name") or "").strip()
+        dep_rename = str(dep.get("rename") or "").strip()
+        if not dep_name or not dep_rename:
+            continue
+
+        alias = _normalize_crate_ident(dep_rename)
+        if not alias:
+            continue
+
+        candidates = []
+        for row in by_name.get(dep_name, []):
+            for target in row.get("targets") or []:
+                kinds = set(target.get("kind") or [])
+                if kinds & {"lib", "rlib", "dylib", "staticlib", "cdylib", "proc-macro"}:
+                    tname = _normalize_crate_ident(target.get("name"))
+                    if tname:
+                        candidates.append(tname)
+        dep_norm = _normalize_crate_ident(dep_name)
+        if dep_norm:
+            candidates.append(dep_norm)
+
+        for key in list(dict.fromkeys(candidates)):
+            artifact = extern_artifacts.get(key)
+            if artifact:
+                rename_map[alias] = artifact
+                break
+    return rename_map
+
+
+def _extract_stablecrateid_conflicts(stderr_text):
+    pairs = []
+    for match in re.finditer(r"found crates \(`([^`]+)` and `([^`]+)`\) with colliding StableCrateId values", str(stderr_text or ""), re.I):
+        left = match.group(1).strip()
+        right = match.group(2).strip()
+        if left and right:
+            pairs.append((left, right))
+    return pairs
+
+
+def _select_prunable_stablecrateid_conflicts(conflict_pairs):
+    removable = []
+    for left, right in conflict_pairs:
+        if left == right:
+            if left.endswith("_core"):
+                removable.append(left)
+            continue
+        for candidate in [left, right]:
+            if candidate.endswith("_core"):
+                removable.append(candidate)
+    return list(dict.fromkeys(removable))
 
 
 def _ensure_rust_cpg_generator(generator_bin):
@@ -271,8 +681,7 @@ def _ensure_rust_cpg_generator(generator_bin):
     manifest = os.path.join(root, "rust_src", "Cargo.toml")
     if not os.path.exists(manifest):
         raise RuntimeError(f"rust-cpg-generator manifest not found: {manifest}")
-    build_env = os.environ.copy()
-    build_env.setdefault("RUSTUP_TOOLCHAIN", "stable")
+    build_env = _analysis_base_env()
     build_env.setdefault("RUSTC_BOOTSTRAP", "1")
     _run_cmd(
         ["cargo", "build", "--release", "--manifest-path", manifest],
@@ -289,6 +698,7 @@ def _prepare_rustc_dynlib_env(base_env=None):
     try:
         sysroot = subprocess.run(
             ["rustc", "--print", "sysroot"],
+            env=env,
             capture_output=True,
             text=True,
             check=True,
@@ -296,6 +706,7 @@ def _prepare_rustc_dynlib_env(base_env=None):
         host = ""
         for line in subprocess.run(
             ["rustc", "-vV"],
+            env=env,
             capture_output=True,
             text=True,
             check=True,
@@ -304,12 +715,17 @@ def _prepare_rustc_dynlib_env(base_env=None):
                 host = line.split(":", 1)[1].strip()
                 break
         if sysroot and host:
+            sysroot_lib = os.path.join(sysroot, "lib")
             rustc_lib = os.path.join(sysroot, "lib", "rustlib", host, "lib")
-            if os.path.isdir(rustc_lib):
-                dyld_prev = env.get("DYLD_LIBRARY_PATH", "")
-                ld_prev = env.get("LD_LIBRARY_PATH", "")
-                env["DYLD_LIBRARY_PATH"] = rustc_lib if not dyld_prev else f"{rustc_lib}:{dyld_prev}"
-                env["LD_LIBRARY_PATH"] = rustc_lib if not ld_prev else f"{rustc_lib}:{ld_prev}"
+            dylib_paths = []
+            for candidate in [sysroot_lib, rustc_lib]:
+                if os.path.isdir(candidate) and candidate not in dylib_paths:
+                    dylib_paths.append(candidate)
+            if dylib_paths:
+                dyld_prev = [p for p in str(env.get("DYLD_LIBRARY_PATH") or "").split(":") if p]
+                ld_prev = [p for p in str(env.get("LD_LIBRARY_PATH") or "").split(":") if p]
+                env["DYLD_LIBRARY_PATH"] = ":".join(dylib_paths + [p for p in dyld_prev if p not in dylib_paths])
+                env["LD_LIBRARY_PATH"] = ":".join(dylib_paths + [p for p in ld_prev if p not in dylib_paths])
     except Exception:
         pass
     return env
@@ -351,8 +767,10 @@ def generate_rust_cpg_for_cargo(
     generator_bin = os.path.join(repo_root, "rust_src", "target", "release", "rust-cpg-generator")
     _ensure_rust_cpg_generator(generator_bin)
 
-    target_dir = os.path.join(cargo_dir, "target_cpg")
+    target_dir_name = os.environ.get("SUPPLYCHAIN_CARGO_TARGET_DIR_NAME", "target_cpg_analysis")
+    target_dir = os.path.join(cargo_dir, target_dir_name)
     deps_dir = os.path.join(target_dir, "debug", "deps")
+    created_placeholder_files = []
     build_cmd = [
         "cargo",
         "build",
@@ -363,61 +781,109 @@ def generate_rust_cpg_for_cargo(
         cargo_all_features=cargo_all_features,
         cargo_no_default_features=cargo_no_default_features,
     )
-    build_env = os.environ.copy()
+    build_env = _analysis_base_env()
     build_env["CARGO_TARGET_DIR"] = target_dir
-    _run_cmd(build_cmd, cwd=cargo_dir, env=build_env, label="cargo build for CPG deps")
+    try:
+        try:
+            _run_cmd(build_cmd, cwd=cargo_dir, env=build_env, label="cargo build for CPG deps")
+        except RuntimeError as exc:
+            missing_paths = _extract_missing_include_paths(str(exc), cargo_dir)
+            if not missing_paths:
+                raise
+            created_placeholder_files.extend(_create_placeholder_include_files(missing_paths))
+            if created_placeholder_files:
+                print(
+                    "[analysis-support] created placeholder include files for cargo build retry: "
+                    + ", ".join(created_placeholder_files),
+                    file=sys.stderr,
+                )
+            _run_cmd(build_cmd, cwd=cargo_dir, env=build_env, label="cargo build for CPG deps (after placeholder retry)")
 
-    extern_rlibs = _collect_extern_rlibs(deps_dir)
-    if not extern_rlibs:
-        raise RuntimeError(f"no rlib dependencies found for CPG generation under: {deps_dir}")
+        extern_artifacts = _collect_extern_artifacts(deps_dir)
+        if not extern_artifacts:
+            raise RuntimeError(f"no dependency artifacts found for CPG generation under: {deps_dir}")
 
-    rustc_args = [
-        f"--edition={edition}",
-        "-L",
-        f"dependency={deps_dir}",
-    ]
-    for feat in enabled_features:
-        feat_text = str(feat or "").strip()
-        if not feat_text:
-            continue
-        rustc_args.extend(["--cfg", f'feature="{feat_text}"'])
-    for name, rlib in extern_rlibs.items():
-        rustc_args.extend(["--extern", f"{name}={rlib}"])
+        gen_env = dict(os.environ)
+        gen_env.setdefault("RUSTUP_TOOLCHAIN", os.environ.get("SUPPLYCHAIN_CPG_TOOLCHAIN", "stable"))
+        gen_env.setdefault("RUSTC_BOOTSTRAP", "1")
+        gen_env["CARGO_PKG_VERSION"] = root_pkg_version
+        gen_env["CARGO_PKG_NAME"] = root_pkg_name
+        gen_env["CARGO_PKG_AUTHORS"] = root_pkg_authors
+        gen_env["CARGO_PKG_DESCRIPTION"] = root_pkg_description
+        gen_env["CARGO_PKG_HOMEPAGE"] = root_pkg_homepage
+        gen_env["CARGO_PKG_REPOSITORY"] = root_pkg_repository
+        gen_env["CARGO_PKG_LICENSE"] = root_pkg_license
+        gen_env["CARGO_PKG_LICENSE_FILE"] = root_pkg_license_file
+        parts = root_pkg_version.split("-", 1)
+        core = parts[0]
+        pre = parts[1] if len(parts) > 1 else ""
+        core_items = core.split(".")
+        gen_env["CARGO_PKG_VERSION_MAJOR"] = core_items[0] if len(core_items) >= 1 else "0"
+        gen_env["CARGO_PKG_VERSION_MINOR"] = core_items[1] if len(core_items) >= 2 else "0"
+        gen_env["CARGO_PKG_VERSION_PATCH"] = core_items[2] if len(core_items) >= 3 else "0"
+        gen_env["CARGO_PKG_VERSION_PRE"] = pre
+        gen_env["CARGO_MANIFEST_DIR"] = root_manifest_dir
+        out_dir = _find_generator_out_dir(input_file, target_dir, cargo_dir=cargo_dir)
+        if out_dir:
+            gen_env.setdefault("OUT_DIR", out_dir)
+        gen_env = _prepare_rustc_dynlib_env(gen_env)
 
-    gen_cmd = [generator_bin, "--input", input_file, "--output", cpg_json]
-    for arg in rustc_args:
-        gen_cmd.extend(["--rustc-arg", arg])
+        dep_rename_externs = _collect_dependency_rename_externs(meta, root_pkg, extern_artifacts)
+        active_externs = dict(extern_artifacts)
+        for alias, artifact in dep_rename_externs.items():
+            active_externs.setdefault(alias, artifact)
+        pruned_externs = []
+        while True:
+            rustc_args = [
+                f"--edition={edition}",
+                "-L",
+                f"dependency={deps_dir}",
+            ]
+            for feat in enabled_features:
+                feat_text = str(feat or "").strip()
+                if not feat_text:
+                    continue
+                rustc_args.extend(["--cfg", f'feature="{feat_text}"'])
+            for name, artifact in active_externs.items():
+                rustc_args.extend(["--extern", f"{name}={artifact}"])
 
-    gen_env = os.environ.copy()
-    gen_env["CARGO_PKG_VERSION"] = root_pkg_version
-    gen_env["CARGO_PKG_NAME"] = root_pkg_name
-    gen_env["CARGO_PKG_AUTHORS"] = root_pkg_authors
-    gen_env["CARGO_PKG_DESCRIPTION"] = root_pkg_description
-    gen_env["CARGO_PKG_HOMEPAGE"] = root_pkg_homepage
-    gen_env["CARGO_PKG_REPOSITORY"] = root_pkg_repository
-    gen_env["CARGO_PKG_LICENSE"] = root_pkg_license
-    gen_env["CARGO_PKG_LICENSE_FILE"] = root_pkg_license_file
-    parts = root_pkg_version.split("-", 1)
-    core = parts[0]
-    pre = parts[1] if len(parts) > 1 else ""
-    core_items = core.split(".")
-    gen_env["CARGO_PKG_VERSION_MAJOR"] = core_items[0] if len(core_items) >= 1 else "0"
-    gen_env["CARGO_PKG_VERSION_MINOR"] = core_items[1] if len(core_items) >= 2 else "0"
-    gen_env["CARGO_PKG_VERSION_PATCH"] = core_items[2] if len(core_items) >= 3 else "0"
-    gen_env["CARGO_PKG_VERSION_PRE"] = pre
-    gen_env["CARGO_MANIFEST_DIR"] = root_manifest_dir
-    gen_env = _prepare_rustc_dynlib_env(gen_env)
-    _run_cmd(gen_cmd, cwd=cargo_dir, env=gen_env, label="rust-cpg-generator")
+            gen_cmd = [generator_bin, "--input", input_file, "--output", cpg_json]
+            for arg in rustc_args:
+                gen_cmd.extend(["--rustc-arg", arg])
+            try:
+                _run_cmd(gen_cmd, cwd=cargo_dir, env=gen_env, label="rust-cpg-generator")
+                break
+            except RuntimeError as exc:
+                conflicts = _extract_stablecrateid_conflicts(str(exc))
+                removable = [crate for crate in _select_prunable_stablecrateid_conflicts(conflicts) if crate in active_externs]
+                if not removable:
+                    raise
+                for crate in removable:
+                    pruned_externs.append(crate)
+                    active_externs.pop(crate, None)
+                print(
+                    "[analysis-support] pruned externs after StableCrateId collision: "
+                    + ", ".join(removable),
+                    file=sys.stderr,
+                )
 
-    if not os.path.exists(cpg_json):
-        raise RuntimeError(f"CPG generation finished but output missing: {cpg_json}")
-    return {
-        "cpg_json": cpg_json,
-        "input_file": input_file,
-        "edition": edition,
-        "enabled_features": enabled_features,
-        "extern_count": len(extern_rlibs),
-    }
+        if not os.path.exists(cpg_json):
+            raise RuntimeError(f"CPG generation finished but output missing: {cpg_json}")
+        return {
+            "cpg_json": cpg_json,
+            "input_file": input_file,
+            "edition": edition,
+            "enabled_features": enabled_features,
+            "extern_count": len(active_externs),
+            "placeholder_files": created_placeholder_files,
+            "pruned_externs": pruned_externs,
+        }
+    finally:
+        for path in reversed(created_placeholder_files):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def import_rust_cpg_json(cpg_json_path, clear_db=True):
@@ -730,10 +1196,36 @@ def _import_native_component_source(
     imported_cache,
     cache_root,
     symbol=None,
+    scope_input_override="",
 ):
     source_root = source_info.get("source_root")
-    symbol_files = find_symbol_source_files(source_root, [symbol]) if symbol else []
-    scope_input = choose_c_analysis_scope(source_root, symbol_files) if symbol else source_root
+    symbol_definition_files = (
+        find_symbol_definition_files(source_root, [symbol])
+        if symbol and find_symbol_definition_files is not None
+        else []
+    )
+    symbol_files = symbol_definition_files or (find_symbol_source_files(source_root, [symbol]) if symbol else [])
+    scope_input = str(scope_input_override or "").strip()
+    if not scope_input:
+        scope_input = choose_c_analysis_scope(source_root, symbol_files) if symbol else source_root
+    if (
+        symbol
+        and not scope_input_override
+        and source_root
+        and scope_input
+        and os.path.abspath(scope_input) == os.path.abspath(source_root)
+    ):
+        return {
+            "status": "skipped",
+            "component": component,
+            "resolved_version": resolved_version,
+            "source_root": source_root,
+            "scope_input": os.path.abspath(source_root),
+            "symbol_files": symbol_files,
+            "symbol_definition_files": symbol_definition_files,
+            "reason": "symbol_scope_too_broad",
+            "symbol": symbol,
+        }
     if not scope_input:
         scope_input = source_root
     cache_key = (component, resolved_version, os.path.abspath(scope_input))
@@ -794,6 +1286,7 @@ def _import_native_component_source(
         "source_root": source_root,
         "scope_input": os.path.abspath(scope_input),
         "symbol_files": symbol_files,
+        "symbol_definition_files": symbol_definition_files,
         "cpg_json": cpg_json,
         "provenance": source_info.get("provenance"),
         "download_url": source_info.get("download_url"),
@@ -941,6 +1434,24 @@ def _recursive_import_native_dependencies(
                 }
             )
             continue
+        child_scope = (
+            choose_c_analysis_scope_from_relative_paths(
+                source_info.get("source_root"),
+                [row.get("path") for row in (item.get("evidence") or [])],
+            )
+            if choose_c_analysis_scope_from_relative_paths is not None
+            else ""
+        )
+        if not child_scope:
+            missing.append(
+                {
+                    "component": child_component,
+                    "resolved_version": child_version,
+                    "reason": "no_precise_ffi_scope",
+                    "dependency_evidence": item.get("evidence") or [],
+                }
+            )
+            continue
         child_import = _import_native_component_source(
             session,
             vuln_rule=vuln_rule,
@@ -951,6 +1462,7 @@ def _recursive_import_native_dependencies(
             imported_cache=imported_cache,
             cache_root=cache_root,
             symbol=None,
+            scope_input_override=child_scope,
         )
         child_recursive = _recursive_import_native_dependencies(
             session,
@@ -1223,6 +1735,81 @@ def _component_lookup_keys(component):
     return list(dict.fromkeys([k for k in keys if k]))
 
 
+def _append_unique_text(items, value):
+    text = str(value or "").strip()
+    if text and text not in items:
+        items.append(text)
+
+
+def _append_unique_rust_sink(items, sink):
+    if isinstance(sink, dict):
+        path = str(sink.get("path") or sink.get("name") or "").strip()
+        name_regex = str(sink.get("name_regex") or "").strip()
+        contains = tuple(str(tok or "").strip() for tok in _ensure_list(sink.get("contains") or sink.get("code_contains")))
+        key = ("dict", path, name_regex, contains)
+    else:
+        key = ("text", str(sink or "").strip())
+    if not key[-1] and key[0] == "text":
+        return
+    for existing in items:
+        if isinstance(existing, dict):
+            ekey = (
+                "dict",
+                str(existing.get("path") or existing.get("name") or "").strip(),
+                str(existing.get("name_regex") or "").strip(),
+                tuple(str(tok or "").strip() for tok in _ensure_list(existing.get("contains") or existing.get("code_contains"))),
+            )
+        else:
+            ekey = ("text", str(existing or "").strip())
+        if ekey == key:
+            return
+    items.append(copy.deepcopy(sink))
+
+
+def _expand_symbol_family(rule):
+    out = copy.deepcopy(rule or {})
+    package = str(out.get("package") or "").strip().lower().replace("_", "-")
+    symbols = [str(sym or "").strip() for sym in _ensure_list(out.get("symbols")) if str(sym or "").strip()]
+    native_sinks = [str(sym or "").strip() for sym in _ensure_list(out.get("native_sinks")) if str(sym or "").strip()]
+    rust_sinks = list(_ensure_list(out.get("rust_sinks")))
+
+    symbol_tokens_lower = {sym.lower() for sym in symbols + native_sinks}
+    is_webp_rule = package in {"libwebp", "webp", "libwebp-sys", "libwebp-sys2", "webp-sys", "webp-sys2", "webp-sys3"}
+    has_webp_seed = any(tok.startswith("webpdecode") or tok.startswith("webpanimdecoder") for tok in symbol_tokens_lower)
+    if is_webp_rule or has_webp_seed:
+        for sym in ("WebPDecode", "WebPDecodeRGBA", "WebPAnimDecoderGetNext"):
+            _append_unique_text(symbols, sym)
+            _append_unique_text(native_sinks, sym)
+        for sink in (
+            {"path": "WebPDecode"},
+            {"path": "WebPDecodeRGBA"},
+            {"path": "WebPAnimDecoderGetNext"},
+        ):
+            _append_unique_rust_sink(rust_sinks, sink)
+
+    is_pcre2_rule = package in {"pcre2", "pcre2-sys", "pcre2-sys2", "pcre2_sys", "grep-pcre2", "grep_pcre2"}
+    has_pcre2_seed = any(tok.startswith("pcre2_") for tok in symbol_tokens_lower)
+    if is_pcre2_rule or has_pcre2_seed:
+        for sym in ("pcre2_match_8", "pcre2_match"):
+            _append_unique_text(symbols, sym)
+            _append_unique_text(native_sinks, sym)
+        for sink in (
+            {"path": "pcre2::bytes::RegexBuilder::build"},
+            {"path": "grep_pcre2::RegexMatcherBuilder::build"},
+            {"path": "RegexBuilder::build", "context_tokens": ["pcre2"]},
+            {"path": "RegexMatcherBuilder::build", "context_tokens": ["pcre2", "regex", "matcher"]},
+        ):
+            _append_unique_rust_sink(rust_sinks, sink)
+
+    if symbols:
+        out["symbols"] = symbols
+    if native_sinks:
+        out["native_sinks"] = native_sinks
+    if rust_sinks:
+        out["rust_sinks"] = rust_sinks
+    return out
+
+
 def _deep_merge_dict(base, extra):
     if not isinstance(base, dict):
         base = {}
@@ -1286,7 +1873,7 @@ def _guess_component_match_crates(component):
         short = base[3:]
     else:
         short = base
-    out = [base, short, f"{short}-sys", f"{short}_sys"]
+    out = [base, short, f"{short}-sys", f"{short}_sys", f"{short}-sys2", f"{short}_sys2"]
     if short == "git2":
         out.extend(["libgit2-sys", "git2", "git2-sys"])
     if short == "webp":
@@ -1313,18 +1900,60 @@ def _infer_source_from_features(features):
     return (None, [])
 
 
+def _source_selector_markers():
+    return {
+        "vendored",
+        "bundled",
+        "source",
+        "static",
+        "build-vendored",
+        "vendored-libgit2",
+        "system",
+        "pkg-config",
+        "pkg_config",
+        "dynamic",
+        "vcpkg",
+    }
+
+
+def _build_feature_map_from_deps(deps):
+    mapping = {}
+    for pkg in deps.get("packages", []) or []:
+        mapping[str(pkg.get("name") or "")] = list(pkg.get("features") or [])
+    return mapping
+
+
+def _filter_speculative_source_features(deps, base_feature_map):
+    selectors = _source_selector_markers()
+    for pkg in deps.get("packages", []) or []:
+        name = str(pkg.get("name") or "")
+        base_features = list(base_feature_map.get(name) or [])
+        base_set = {str(f).lower() for f in base_features}
+        merged = []
+        for feat in pkg.get("features", []) or []:
+            feat_text = str(feat or "")
+            if not feat_text:
+                continue
+            feat_lower = feat_text.lower()
+            if feat_lower in selectors and feat_lower not in base_set:
+                continue
+            if feat_text not in merged:
+                merged.append(feat_text)
+        pkg["features"] = merged
+
+
 def _inspect_build_script(manifest_path):
     if not manifest_path:
-        return {"exists": False, "source_hint": None, "signals": [], "native_versions": []}
+        return {"exists": False, "source_hint": None, "signals": [], "native_versions": [], "linked_libs": []}
     crate_dir = os.path.dirname(manifest_path)
     build_rs = os.path.join(crate_dir, "build.rs")
     if not os.path.exists(build_rs):
-        return {"exists": False, "source_hint": None, "signals": [], "native_versions": []}
+        return {"exists": False, "source_hint": None, "signals": [], "native_versions": [], "linked_libs": []}
     try:
         with open(build_rs, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
     except Exception:
-        return {"exists": True, "source_hint": None, "signals": [], "native_versions": []}
+        return {"exists": True, "source_hint": None, "signals": [], "native_versions": [], "linked_libs": []}
 
     lowered = text.lower()
     signals = []
@@ -1333,6 +1962,13 @@ def _inspect_build_script(manifest_path):
     has_pkg_config = "pkg_config" in lowered or "pkg-config" in lowered
     has_vcpkg = "vcpkg" in lowered
     has_vendor_word = "vendored" in lowered or "bundled" in lowered
+    linked_libs = []
+    for match in re.finditer(r"cargo:rustc-link-lib(?:=[^\"\\n]*)?=([A-Za-z0-9_\\-\\.]+)", text):
+        lib = match.group(1).strip()
+        if lib and lib not in linked_libs:
+            linked_libs.append(lib)
+    if linked_libs:
+        signals.append("cargo_link_lib")
 
     if has_cc:
         signals.append("cc_build")
@@ -1345,7 +1981,9 @@ def _inspect_build_script(manifest_path):
     if has_vendor_word:
         signals.append("vendor_word")
 
-    if (has_cc or has_cmake or has_vendor_word) and not (has_pkg_config or has_vcpkg):
+    if linked_libs and not (has_cc or has_cmake or has_vendor_word):
+        source_hint = "system"
+    elif (has_cc or has_cmake or has_vendor_word) and not (has_pkg_config or has_vcpkg):
         source_hint = "bundled"
     elif (has_pkg_config or has_vcpkg) and not (has_cc or has_cmake):
         source_hint = "system"
@@ -1364,6 +2002,177 @@ def _inspect_build_script(manifest_path):
         "source_hint": source_hint,
         "signals": signals,
         "native_versions": native_versions[:8],
+        "linked_libs": linked_libs,
+    }
+
+
+def _read_manifest_identity(manifest_path):
+    info = {"name": None, "version": None}
+    if not manifest_path or not os.path.exists(manifest_path):
+        return info
+    try:
+        text = Path(manifest_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return info
+    for key in ("name", "version"):
+        match = re.search(rf'(?m)^\\s*{re.escape(key)}\\s*=\\s*"([^"]+)"', text)
+        if match:
+            info[key] = match.group(1).strip()
+    return info
+
+
+def _root_lib_rs_path(cargo_dir):
+    root = str(cargo_dir or "").strip()
+    if not root:
+        return ""
+    path = os.path.join(root, "src", "lib.rs")
+    return path if os.path.exists(path) else ""
+
+
+def _root_has_bindings_include(cargo_dir):
+    path = _root_lib_rs_path(cargo_dir)
+    if not path:
+        return False
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    lowered = text.lower()
+    include_markers = [
+        'include!(concat!(env!("out_dir"), "/bindings.rs"))',
+        "include!(concat!(env!(\"out_dir\"), '/bindings.rs'))",
+        'include!(concat!(env!("out_dir"),"/bindings.rs"))',
+    ]
+    if any(marker in lowered for marker in include_markers):
+        return True
+    # Common wrapper pattern:
+    #   mod bindings { include!(concat!(env!("OUT_DIR"), "/bindings.rs")); }
+    if "mod bindings" in lowered and "bindings.rs" in lowered and "out_dir" in lowered:
+        return True
+    return False
+
+
+def _root_is_thin_bindings_gateway(cargo_dir, max_code_lines=16):
+    path = _root_lib_rs_path(cargo_dir)
+    if not path:
+        return False
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return False
+    if not _root_has_bindings_include(cargo_dir):
+        return False
+
+    code_lines = []
+    for line in lines:
+        text = str(line or "").strip()
+        if not text:
+            continue
+        if text.startswith("//"):
+            continue
+        if text.startswith("#!"):
+            continue
+        code_lines.append(text)
+    return len(code_lines) <= max(1, int(max_code_lines or 16))
+
+
+def _native_component_probe_aliases(component):
+    text = str(component or "").strip().lower().replace("_", "-")
+    if not text:
+        return set()
+    short = text[3:] if text.startswith("lib") and len(text) > 3 else text
+    aliases = {
+        text,
+        short,
+        text.replace("-", "_"),
+        short.replace("-", "_"),
+    }
+    if short == "webp":
+        aliases.update({"webpdecoder", "webpdemux", "webpmux"})
+    if short == "pcre2":
+        aliases.update({"pcre2-8", "pcre2_8"})
+    for token in list(aliases):
+        normalized = str(token or "").strip().lower().replace("_", "-")
+        if not normalized:
+            continue
+        stripped = re.sub(r"-(sys|src|bindings|ffi)\d*$", "", normalized)
+        if stripped:
+            aliases.add(stripped)
+        if stripped.startswith("lib") and len(stripped) > 3:
+            aliases.add(stripped[3:])
+    return {item for item in aliases if item}
+
+
+def _root_wrapper_component_instance(cargo_dir, component, vuln_rule=None):
+    cargo_root = str(cargo_dir or "").strip()
+    if not cargo_root or not os.path.isdir(cargo_root):
+        return None
+    manifest_path = os.path.join(cargo_root, "Cargo.toml")
+    build_info = _inspect_build_script(manifest_path)
+    aliases = _native_component_probe_aliases(component)
+    linked = {
+        str(item or "").strip().lower().replace("_", "-")
+        for item in (build_info.get("linked_libs") or [])
+        if str(item or "").strip()
+    }
+    link_hit = bool(linked & aliases)
+
+    source_hit = False
+    symbol_tokens = []
+    for sym in _ensure_list((vuln_rule or {}).get("symbols")):
+        symbol_tokens.append(str(sym or "").strip())
+    for token in list(aliases) + symbol_tokens:
+        if not token:
+            continue
+        pattern = re.compile(rf"\\b{re.escape(token)}\\b", re.IGNORECASE)
+        for path in Path(cargo_root).rglob("*.rs"):
+            rel = str(path).replace("\\\\", "/")
+            if "/target" in rel:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if pattern.search(text):
+                source_hit = True
+                break
+        if source_hit:
+            break
+
+    if not link_hit and not source_hit and not build_info.get("exists"):
+        return None
+
+    manifest_info = _read_manifest_identity(manifest_path)
+    system_probe = _probe_system_native_version(component)
+
+    source = build_info.get("source_hint") or ("system" if link_hit and system_probe else "unknown")
+    resolved_version = None
+    if source == "system" and system_probe and system_probe.get("version"):
+        resolved_version = system_probe.get("version")
+    elif build_info.get("native_versions"):
+        resolved_version = build_info["native_versions"][0]
+    elif manifest_info.get("version") and source == "bundled":
+        resolved_version = manifest_info["version"]
+
+    return {
+        "component": component,
+        "status": "resolved" if resolved_version else "unknown",
+        "resolved_version": resolved_version,
+        "source": source,
+        "enabled_features": [],
+        "matched_crates": [
+            {
+                "crate": manifest_info.get("name") or Path(cargo_root).name,
+                "versions": [manifest_info.get("version")] if manifest_info.get("version") else [],
+                "features": [],
+                "sources": ["cargo"],
+                "manifest_paths": [manifest_path] if os.path.exists(manifest_path) else [],
+            }
+        ],
+        "resolution_evidence": [
+            {"kind": "root_wrapper_probe", "build_script": build_info, "link_hit": link_hit, "source_hit": source_hit},
+            *([{"kind": "system_probe", "probe": system_probe}] if system_probe else []),
+        ],
     }
 
 
@@ -1371,7 +2180,7 @@ _SYSTEM_NATIVE_VERSION_CACHE = {}
 
 
 def _extract_semver_token(text):
-    match = re.search(r"([0-9]+\.[0-9]+\.[0-9]+)", str(text or ""))
+    match = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", str(text or ""))
     if not match:
         return None
     return match.group(1)
@@ -1393,44 +2202,62 @@ def _native_version_override(component):
     }
 
 
-def _probe_system_native_version(component):
-    normalized = str(component or "").strip().lower()
+def _system_probe_component_keys(component):
+    normalized = str(component or "").strip().lower().replace("_", "-")
     if not normalized:
-        return None
-    override = _native_version_override(component)
-    cache_key = (normalized, override.get("version") if override else None)
-    if cache_key in _SYSTEM_NATIVE_VERSION_CACHE:
-        return _SYSTEM_NATIVE_VERSION_CACHE[cache_key]
-    if override:
-        _SYSTEM_NATIVE_VERSION_CACHE[cache_key] = override
-        return override
+        return []
+    keys = []
+    for token in _native_component_probe_aliases(component):
+        lowered = str(token or "").strip().lower().replace("_", "-")
+        if not lowered:
+            continue
+        if lowered not in keys:
+            keys.append(lowered)
+        stripped = re.sub(r"-(sys|src|bindings|ffi)\d*$", "", lowered)
+        if stripped and stripped not in keys:
+            keys.append(stripped)
+        if stripped.startswith("lib") and len(stripped) > 3:
+            short = stripped[3:]
+            if short and short not in keys:
+                keys.append(short)
+    if normalized not in keys:
+        keys.insert(0, normalized)
+    return keys
 
-    candidates = []
-    if normalized == "openssl":
-        candidates = [
+
+def _system_probe_candidates(component_key):
+    key = str(component_key or "").strip().lower().replace("_", "-")
+    if key == "openssl":
+        return [
             ("pkg-config", ["pkg-config", "--modversion", "openssl"]),
             ("openssl-cli", ["openssl", "version"]),
         ]
-    elif normalized == "libxml2":
-        candidates = [
+    if key in {"libxml2", "xml2"}:
+        return [
             ("pkg-config", ["pkg-config", "--modversion", "libxml-2.0"]),
             ("xml2-config", ["xml2-config", "--version"]),
         ]
-    elif normalized == "libheif":
-        candidates = [
+    if key in {"libheif", "heif"}:
+        return [
             ("pkg-config", ["pkg-config", "--modversion", "libheif"]),
         ]
-    elif normalized in {"libwebp", "webp"}:
-        candidates = [
+    if key in {"libwebp", "webp"}:
+        return [
             ("pkg-config", ["pkg-config", "--modversion", "libwebp"]),
         ]
-    elif normalized == "freetype":
-        candidates = [
+    if key in {"pcre2", "libpcre2", "pcre2-8"}:
+        return [
+            ("pkg-config", ["pkg-config", "--modversion", "libpcre2-8"]),
+            ("pkg-config", ["pkg-config", "--modversion", "pcre2"]),
+            ("pcre2-config", ["pcre2-config", "--version"]),
+        ]
+    if key in {"freetype", "freetype2"}:
+        return [
             ("freetype-config", ["freetype-config", "--ftversion"]),
             ("pkg-config", ["pkg-config", "--modversion", "freetype2"]),
         ]
-    elif normalized == "zlib":
-        candidates = [
+    if key == "zlib":
+        return [
             (
                 "python-ctypes",
                 [
@@ -1441,42 +2268,63 @@ def _probe_system_native_version(component):
             ),
             ("pkg-config", ["pkg-config", "--modversion", "zlib"]),
         ]
+    return []
 
-    for tool_name, cmd in candidates:
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            continue
-        if proc.returncode != 0:
-            continue
-        version = _extract_semver_token(proc.stdout) or _extract_semver_token(proc.stderr)
-        if (
-            normalized == "freetype"
-            and tool_name == "pkg-config"
-            and version
-            and re.match(r"^\d+\.\d+\.\d+$", version)
-        ):
-            try:
-                major = int(version.split(".", 1)[0])
-            except ValueError:
-                major = None
-            if major is not None and major >= 10:
+
+def _probe_system_native_version(component):
+    normalized = str(component or "").strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    override = _native_version_override(component)
+    cache_key = (normalized, override.get("version") if override else None)
+    if cache_key in _SYSTEM_NATIVE_VERSION_CACHE:
+        return _SYSTEM_NATIVE_VERSION_CACHE[cache_key]
+    if override:
+        _SYSTEM_NATIVE_VERSION_CACHE[cache_key] = override
+        return override
+
+    seen_commands = set()
+    for probe_key in _system_probe_component_keys(component):
+        for tool_name, cmd in _system_probe_candidates(probe_key):
+            cmd_key = tuple(cmd)
+            if cmd_key in seen_commands:
                 continue
-        if not version:
-            continue
-        result = {
-            "tool": tool_name,
-            "command": cmd,
-            "version": version,
-        }
-        _SYSTEM_NATIVE_VERSION_CACHE[cache_key] = result
-        return result
+            seen_commands.add(cmd_key)
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                continue
+            if proc.returncode != 0:
+                continue
+            version = _extract_semver_token(proc.stdout) or _extract_semver_token(proc.stderr)
+            if (
+                probe_key in {"freetype", "freetype2"}
+                and tool_name == "pkg-config"
+                and version
+                and re.match(r"^\d+\.\d+\.\d+$", version)
+            ):
+                try:
+                    major = int(version.split(".", 1)[0])
+                except ValueError:
+                    major = None
+                if major is not None and major >= 10:
+                    continue
+            if not version:
+                continue
+            result = {
+                "tool": tool_name,
+                "command": cmd,
+                "version": version,
+                "component_key": probe_key,
+            }
+            _SYSTEM_NATIVE_VERSION_CACHE[cache_key] = result
+            return result
 
     _SYSTEM_NATIVE_VERSION_CACHE[cache_key] = None
     return None
@@ -1493,6 +2341,11 @@ def resolve_native_component_instances(vuln_rule, package_metadata, cargo_dir=""
     if not candidate_crates:
         candidate_crates = _guess_component_match_crates(component)
     norm_candidates = {c.lower().replace("_", "-"): c for c in candidate_crates}
+    normalized_candidates = {
+        _normalize_native_crate_name(c.lower().replace("_", "-")): c
+        for c in candidate_crates
+        if _normalize_native_crate_name(c.lower().replace("_", "-"))
+    }
 
     matched_crates = []
     for crate_name, meta in (package_metadata or {}).items():
@@ -1500,10 +2353,18 @@ def resolve_native_component_instances(vuln_rule, package_metadata, cargo_dir=""
         if norm in norm_candidates:
             matched_crates.append((crate_name, meta))
             continue
+        if _normalize_native_crate_name(norm) in normalized_candidates:
+            matched_crates.append((crate_name, meta))
+            continue
         if crate_name == component:
             matched_crates.append((crate_name, meta))
 
     if not matched_crates:
+        root_wrapper = _root_wrapper_component_instance(cargo_dir, component, vuln_rule=vuln_rule)
+        if root_wrapper:
+            root_wrapper["resolution_evidence"] = list(root_wrapper.get("resolution_evidence") or [])
+            root_wrapper["resolution_evidence"].append({"kind": "missing_candidate_crates"})
+            return [root_wrapper]
         if system_probe and system_probe.get("version"):
             return [
                 {
@@ -1567,6 +2428,11 @@ def resolve_native_component_instances(vuln_rule, package_metadata, cargo_dir=""
     build_inspects = [_inspect_build_script(p) for p in all_manifest_paths]
     build_hints = [r.get("source_hint") for r in build_inspects if r.get("source_hint")]
     build_versions = []
+    sys_like_matched = False
+    for row in crate_rows:
+        crate_name = str(row.get("crate") or "").lower().replace("_", "-")
+        if re.search(r"-(sys|src|bindings|ffi)\d*$", crate_name):
+            sys_like_matched = True
     for row in build_inspects:
         for ver in row.get("native_versions") or []:
             if ver not in build_versions:
@@ -1584,15 +2450,25 @@ def resolve_native_component_instances(vuln_rule, package_metadata, cargo_dir=""
 
     if source_status_hint == "system" and system_probe and system_probe.get("version"):
         source = "system"
+    elif sys_like_matched and source != "bundled":
+        system_probe = system_probe or _probe_system_native_version(component)
+        if system_probe and system_probe.get("version"):
+            source = "system"
     resolved_version = None
     if source_status_hint == "system" and system_probe and system_probe.get("version"):
         resolved_version = system_probe.get("version")
-    elif build_versions:
-        resolved_version = build_versions[0]
-    elif component in package_metadata and (package_metadata.get(component) or {}).get("versions"):
-        resolved_version = list((package_metadata.get(component) or {}).get("versions") or [None])[0]
-    elif all_versions:
-        resolved_version = all_versions[0]
+    elif source == "system":
+        system_probe = system_probe or _probe_system_native_version(component)
+        if system_probe and system_probe.get("version"):
+            resolved_version = system_probe.get("version")
+
+    if not resolved_version:
+        if build_versions:
+            resolved_version = build_versions[0]
+        elif component in package_metadata and (package_metadata.get(component) or {}).get("versions"):
+            resolved_version = list((package_metadata.get(component) or {}).get("versions") or [None])[0]
+        elif all_versions:
+            resolved_version = all_versions[0]
 
     evidence = []
     if feat_signals:
@@ -1837,6 +2713,7 @@ def _merge_trigger_conditions(trigger_model, conditions=None, mitigations=None):
 
 def normalize_vuln_rule(vuln):
     rule = copy.deepcopy(vuln or {})
+    rule = _expand_symbol_family(rule)
     compiled_conditions = []
     compiled_mitigations = []
     explicit_trigger_conditions = list((rule.get("trigger_model", {}) or {}).get("conditions") or [])
@@ -2113,6 +2990,21 @@ def evaluate_version_guard(package_versions, package_name, version_range):
     }
 
 
+def _should_relax_version_guard_failure(vuln_rule, component_instances, version_eval):
+    if str((version_eval or {}).get("status") or "") != "failed":
+        return False
+    pkg = str((vuln_rule or {}).get("package") or "").strip().lower().replace("-", "_")
+    if pkg not in {"pcre2", "pcre2_sys"}:
+        return False
+    source_hint = str((vuln_rule or {}).get("source_status") or "").strip().lower()
+    if source_hint == "system":
+        return True
+    for inst in component_instances or []:
+        if str((inst or {}).get("source") or "").strip().lower() == "system":
+            return True
+    return False
+
+
 def _extract_text_corpus(chain_nodes=None, control_nodes=None, calls=None):
     texts = []
     for node in chain_nodes or []:
@@ -2137,6 +3029,19 @@ def _extract_text_corpus(chain_nodes=None, control_nodes=None, calls=None):
         if isinstance(code, str) and code.strip():
             texts.append(code)
     return texts
+
+
+def _extract_text_window(text, start, end, radius=120):
+    body = str(text or "")
+    if not body:
+        return ""
+    try:
+        lo = max(0, int(start or 0) - int(radius or 0))
+        hi = min(len(body), int(end or 0) + int(radius or 0))
+    except Exception:
+        return body[: max(0, int(radius or 0) * 2)]
+    snippet = body[lo:hi].strip()
+    return snippet or body[lo:hi]
 
 
 def _eval_env_guard_atom(atom, package_metadata, vuln_package, component_instances=None, analysis_context=None):
@@ -2359,7 +3264,13 @@ def evaluate_env_guards(vuln_rule, package_metadata, package_versions, component
     if version_eval.get("status") == "satisfied":
         status_items.append({"status": "satisfied", "kind": "version_range", "detail": version_eval})
     elif version_eval.get("status") == "failed":
-        status_items.append({"status": "failed", "kind": "version_range", "detail": version_eval})
+        if _should_relax_version_guard_failure(vuln_rule, component_instances, version_eval):
+            relaxed = dict(version_eval)
+            relaxed["status"] = "unknown"
+            relaxed["reason"] = "system_version_env_dependent"
+            status_items.append({"status": "unknown", "kind": "version_range", "detail": relaxed})
+        else:
+            status_items.append({"status": "failed", "kind": "version_range", "detail": version_eval})
     elif version_eval.get("status") == "unknown":
         status_items.append({"status": "unknown", "kind": "version_range", "detail": version_eval})
 
@@ -2501,7 +3412,51 @@ def collect_assumption_evidence(vuln_rule, existential_input_result, path_bundle
     return assumptions
 
 
-def map_result_kind(triggerable_internal, reachable, assumptions_used):
+def _manual_name_variants(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    variants = {raw, raw.lower(), raw.replace("-", "_"), raw.replace("_", "-")}
+    lowered = raw.lower()
+    if lowered.startswith("lib") and len(lowered) > 3:
+        variants.add(lowered[3:])
+    suffixes = ("-sys2", "_sys2", "-sys", "_sys", "-rs", "_rs")
+    for variant in list(variants):
+        lowered_variant = variant.lower()
+        for suffix in suffixes:
+            if lowered_variant.endswith(suffix) and len(lowered_variant) > len(suffix):
+                stripped = lowered_variant[: -len(suffix)]
+                variants.add(stripped)
+                variants.add(stripped.replace("-", "_"))
+                variants.add(stripped.replace("_", "-"))
+    return {item for item in variants if item}
+
+
+def select_manual_evidence(entries, *, cve=None, package=None, symbol=None):
+    if not entries:
+        return None
+    cve_text = str(cve or "").strip()
+    pkg_variants = _manual_name_variants(package)
+    sym_text = str(symbol or "").strip()
+    for entry in entries:
+        entry_cve = str(entry.get("cve") or "").strip()
+        if entry_cve and cve_text and entry_cve != cve_text:
+            continue
+        entry_pkg = str(entry.get("package") or entry.get("component") or "").strip()
+        if entry_pkg and pkg_variants and not (_manual_name_variants(entry_pkg) & pkg_variants):
+            continue
+        entry_symbol = str(entry.get("symbol") or "").strip()
+        if entry_symbol and sym_text and entry_symbol != sym_text:
+            continue
+        return entry
+    return None
+
+
+def map_result_kind(triggerable_internal, reachable, assumptions_used, manual_status=None):
+    if manual_status == "observable_triggered":
+        return "ObservableTriggered"
+    if manual_status == "path_triggered":
+        return "PathTriggered"
     if not reachable:
         return "NotTriggerable"
     if triggerable_internal in {"false_positive", "unreachable"}:
@@ -2531,6 +3486,448 @@ def has_actionable_trigger_hits(trigger_hits):
                 if name:
                     return True
     return False
+
+
+def has_cross_language_native_evidence(
+    *,
+    source_status,
+    call_reachability_source,
+    has_method,
+    strict_callsite_edges,
+    native_analysis_coverage,
+    native_dependency_imports,
+    strict_dependency_resolution,
+):
+    status = str(source_status or "").strip()
+    if status not in {"stub", "binary-only", "system"}:
+        return True
+    if has_method and call_reachability_source in {"c_method", "c_call", "symbol_usage"}:
+        return True
+    if int(strict_callsite_edges or 0) > 0:
+        return True
+    if str(native_analysis_coverage or "") in {"symbol_level", "callsite_level"}:
+        return True
+    if (strict_dependency_resolution or {}).get("dependencies") and native_dependency_imports:
+        return True
+    return False
+
+
+def has_explicit_native_symbol_bridge(symbol, evidence_call_sets):
+    target = str(symbol or "").strip().lower()
+    if not target:
+        return False
+    ffi_markers = ("sys::", "ffi::", "bindings::", "gdal_sys::", "libxml::bindings::", "pcre2_sys::")
+    for call in evidence_call_sets or []:
+        call = call or {}
+        name = str((call or {}).get("name") or "").strip().lower()
+        code = str((call or {}).get("code") or "").strip().lower()
+        scope = str(call.get("scope") or "")
+        file_path = str(call.get("file") or "").replace("\\", "/").lower()
+        if _native_symbol_names_match(target, name) and scope == "synthetic_package_method_code":
+            return True
+        if (
+            target
+            and code
+            and _code_references_native_symbol(code, target)
+            and (
+                scope == "synthetic_package_method_code"
+                or (
+                    scope == "synthetic_source_text"
+                    and file_path
+                    and "/src/" in file_path
+                    and "/target_" not in file_path
+                    and not file_path.endswith("/readme.md")
+                    and any(marker in code for marker in ffi_markers)
+                )
+            )
+        ):
+            return True
+    return False
+
+
+def _native_symbol_names_match(target, observed):
+    target_raw = str(target or "").strip()
+    observed_raw = str(observed or "").strip()
+    target_text = target_raw.lower()
+    observed_text = observed_raw.lower()
+    if not target_text or not observed_text:
+        return False
+    if target_text == observed_text:
+        return True
+    if observed_text.startswith(target_text) and len(observed_text) > len(target_text):
+        suffix_raw = observed_raw[len(target_raw):]
+        if suffix_raw and (suffix_raw[0].isupper() or suffix_raw[0].isdigit() or suffix_raw[0] == "_"):
+            return True
+    return False
+
+
+def _code_references_native_symbol(code, target):
+    target_text = str(target or "").strip().lower()
+    text = str(code or "").strip().lower()
+    if not target_text or not text:
+        return False
+    if target_text in text:
+        return True
+    pattern = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for match in pattern.finditer(text):
+        if _native_symbol_names_match(target_text, match.group(2).lower()):
+            return True
+    return False
+
+
+def has_dependency_source_symbol_bridge(symbol, deps, crate_hints=None):
+    target = str(symbol or "").strip()
+    if not target:
+        return False
+    target_lower = target.lower()
+    ffi_markers = (
+        f"sys::{target_lower}",
+        f"ffi::{target_lower}",
+        f"bindings::{target_lower}",
+        f"gdal_sys::{target_lower}",
+        f"pcre2_sys::{target_lower}",
+    )
+    crate_hints = {str(item or "").strip().lower() for item in (crate_hints or []) if str(item or "").strip()}
+    packages = list((deps or {}).get("packages") or [])
+    for pkg in packages:
+        pkg = pkg or {}
+        name = str(pkg.get("name") or "").strip().lower()
+        if crate_hints and name not in crate_hints:
+            continue
+        manifest_path = str(pkg.get("manifest_path") or "").strip()
+        if not manifest_path:
+            continue
+        src_dir = os.path.join(os.path.dirname(manifest_path), "src")
+        if not os.path.isdir(src_dir):
+            continue
+        for base, _, files in os.walk(src_dir):
+            for filename in files:
+                if not filename.endswith(".rs"):
+                    continue
+                path = os.path.join(base, filename)
+                try:
+                    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                text_lower = text.lower()
+                if target_lower not in text_lower:
+                    continue
+                if any(marker in text_lower for marker in ffi_markers):
+                    return True
+                if "use crate::bindings::*;" in text_lower and f"{target_lower}(" in text_lower:
+                    return True
+    return False
+
+
+def _looks_like_comment_line(text):
+    stripped = str(text or "").lstrip()
+    return stripped.startswith("//") or stripped.startswith("///") or stripped.startswith("//!") or stripped.startswith("*") or stripped.startswith("/*")
+
+
+def collect_package_native_gateway_calls(session, root_pkg, crate_aliases, max_methods=800):
+    aliases = {str(item or "").strip().lower() for item in (crate_aliases or []) if str(item or "").strip()}
+    if not aliases:
+        return []
+    rows = session.run(
+        """
+        MATCH (m:METHOD:Rust)
+        WHERE coalesce(m.package, "") = $pkg
+        RETURN m.id AS id, m.name AS name, m.code AS code
+        LIMIT $limit
+        """,
+        pkg=root_pkg,
+        limit=max(1, int(max_methods)),
+    )
+    pattern = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    out = []
+    seen = set()
+    for row in rows:
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        for match in pattern.finditer(code):
+            alias = match.group(1).lower()
+            symbol = match.group(2)
+            if alias not in aliases:
+                continue
+            key = (row.get("id"), alias, symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "id": f"nativegateway:{row.get('id')}:{alias}:{symbol}",
+                    "name": symbol,
+                    "code": _extract_text_window(code, match.start(), match.end()),
+                    "lang": "Rust",
+                    "method": row.get("name"),
+                    "scope": "synthetic_native_gateway_package",
+                    "gateway_alias": alias,
+                }
+            )
+    return out
+
+
+def collect_source_native_gateway_calls(project_dir, crate_aliases, max_files=4000, max_hits=400):
+    root = str(project_dir or "").strip()
+    aliases = {str(item or "").strip().lower() for item in (crate_aliases or []) if str(item or "").strip()}
+    if not root or not os.path.isdir(root) or not aliases:
+        return []
+    pattern = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    out = []
+    seen = set()
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in {"target", "target_cpg", ".git", ".idea", ".vscode"}]
+        for filename in filenames:
+            if scanned >= max_files or len(out) >= max_hits:
+                break
+            if not filename.endswith(".rs"):
+                continue
+            scanned += 1
+            path = os.path.join(dirpath, filename)
+            try:
+                if os.path.getsize(path) > 2 * 1024 * 1024:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                    content = handle.read()
+            except Exception:
+                continue
+            relpath = os.path.relpath(path, root)
+            for match in pattern.finditer(content):
+                alias = match.group(1).lower()
+                symbol = match.group(2)
+                if alias not in aliases:
+                    continue
+                line_no = content.count("\n", 0, match.start()) + 1
+                line_start = content.rfind("\n", 0, match.start()) + 1
+                line_end = content.find("\n", match.start())
+                if line_end < 0:
+                    line_end = len(content)
+                line_text = content[line_start:line_end].strip()
+                if _looks_like_comment_line(line_text):
+                    continue
+                key = (relpath, line_no, alias, symbol)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    {
+                        "id": f"nativegwsrc:{relpath}:{line_no}:{alias}:{symbol}",
+                        "name": symbol,
+                        "code": line_text,
+                        "lang": "Rust",
+                        "method": f"{relpath}:{line_no}",
+                        "scope": "synthetic_native_gateway_source",
+                        "file": relpath,
+                        "line": line_no,
+                        "gateway_alias": alias,
+                    }
+                )
+                if len(out) >= max_hits:
+                    break
+        if scanned >= max_files or len(out) >= max_hits:
+            break
+    return out
+
+
+def _native_component_dependency_candidates(component, native_component_instances):
+    candidates = []
+    seen = set()
+
+    def add(name):
+        text = str(name or "").strip()
+        if not text:
+            return
+        key = text.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(text)
+
+    add(component)
+    for instance in native_component_instances or []:
+        for row in instance.get("matched_crates") or []:
+            crate_name = row.get("crate")
+            add(crate_name)
+            for alias in _candidate_native_crate_aliases(crate_name):
+                add(alias)
+    return candidates
+
+
+def find_best_dep_chain(session, root, pkg, native_component_instances=None):
+    candidates = _native_component_dependency_candidates(pkg, native_component_instances)
+    if not candidates:
+        return {"target": None, "chain": [], "edges": []}
+    rows = session.run(
+        """
+        MATCH p=(root:PACKAGE {name: $root})-[:DEPENDS_ON|NATIVE_DEPENDS_ON*0..]->(pkg:PACKAGE)
+        WHERE pkg.name IN $pkg_names
+        RETURN pkg.name AS target,
+               CASE WHEN pkg.name = $preferred THEN 0 ELSE 1 END AS preferred_rank,
+               length(p) AS plen,
+               [n IN nodes(p) | n.name] AS chain,
+               [rel IN relationships(p) | {
+                   from: startNode(rel).name,
+                   to: endNode(rel).name,
+                   type: type(rel),
+                   evidence_type: rel.evidence_type,
+                   confidence: rel.confidence,
+                   source: rel.source,
+                   evidence: rel.evidence
+               }] AS edges
+        ORDER BY preferred_rank ASC, plen ASC
+        LIMIT 8
+        """,
+        root=root,
+        preferred=pkg,
+        pkg_names=candidates,
+    )
+    for row in rows:
+        return {
+            "target": row.get("target"),
+            "chain": list(row.get("chain") or []),
+            "edges": list(row.get("edges") or []),
+        }
+    return {"target": None, "chain": [], "edges": []}
+
+
+def has_transitive_native_symbol_bridge(session, component, gateway_symbols, target_symbol, max_depth=10):
+    if session is None or not component or not target_symbol:
+        return False
+    symbols = [str(item or "").strip() for item in (gateway_symbols or []) if str(item or "").strip()]
+    if not symbols:
+        return False
+    target = str(target_symbol or "").strip()
+    if any(_native_symbol_names_match(target, sym) for sym in symbols):
+        return True
+    try:
+        record = session.run(
+            """
+            UNWIND $sources AS src_name
+            MATCH p = (:METHOD:C {package: $component, name: src_name})-[:CALL*1..10]->(:METHOD:C {package: $component, name: $target})
+            RETURN 1 AS ok
+            LIMIT 1
+            """,
+            component=component,
+            sources=symbols[:64],
+            target=target,
+        ).single()
+    except Exception:
+        return False
+    return bool(record)
+
+
+def _is_weak_rust_code_reachability_source(source):
+    return str(source or "").strip() in {"rust_method_code_root", "rust_method_code_package"}
+
+
+def _score_public_entry_name(name):
+    text = str(name or "").strip()
+    lowered = text.lower()
+    if not lowered:
+        return 0
+    score = 0
+    # Prefer realistic externally-used entry methods over constructors/formatters.
+    strong_tokens = (
+        "search_slice",
+        "search_reader",
+        "from_bytes",
+        "read_from_bytes",
+        "blob2image",
+        "decode",
+        "parse",
+        "scan",
+        "search",
+        "match",
+        "find",
+        "compile",
+        "open",
+        "load",
+    )
+    if any(tok in lowered for tok in strong_tokens):
+        score += 120
+    if lowered in {"new", "default", "fmt", "clone", "drop"}:
+        score -= 180
+    if lowered.startswith("test_") or lowered.startswith("bench_"):
+        score -= 120
+    if "src/" in lowered and ":" in lowered:
+        # "src/foo.rs:123" pseudo methods from source scans are weaker than real method names.
+        score -= 20
+    return score
+
+
+def _score_native_gateway_call(call, symbol="", sink_candidates=None):
+    row = dict(call or {})
+    name = str(row.get("name") or "").strip()
+    code = str(row.get("code") or "").strip()
+    method = str(row.get("method") or "").strip()
+    score = 0
+    if symbol and _native_symbol_names_match(symbol, name):
+        score += 1000
+    if symbol and _code_references_native_symbol(code, symbol):
+        score += 700
+
+    for spec in _normalize_sink_candidate_specs(sink_candidates or []):
+        token = str(spec.get("token") or "").strip()
+        if token and _name_matches_sink_token(name, token):
+            score += 240
+        if token and _name_matches_sink_token(method, token):
+            score += 80
+        if _sink_spec_matches_text(spec, code):
+            score += 40
+
+    score += _score_public_entry_name(name)
+    score += _score_public_entry_name(method)
+
+    lowered = name.lower()
+    if re.search(r"(decode|parse|read|open|load|compile|scan|next)$", lowered):
+        score += 60
+    if re.search(r"(clear|delete|free|destroy|drop|release)$", lowered):
+        score -= 120
+
+    scope = str(row.get("scope") or "")
+    if scope == "synthetic_native_gateway_source":
+        score += 20
+    elif scope == "synthetic_native_gateway_package":
+        score += 10
+
+    line = row.get("line")
+    try:
+        score -= min(int(line or 0), 10000) / 100000.0
+    except Exception:
+        pass
+    return score
+
+
+def select_relevant_native_gateway_calls(calls, symbol="", sink_candidates=None, limit=2):
+    ranked = []
+    for idx, call in enumerate(calls or []):
+        ranked.append(
+            (
+                _score_native_gateway_call(call, symbol=symbol, sink_candidates=sink_candidates),
+                -idx,
+                call,
+            )
+        )
+    ranked.sort(reverse=True)
+    out = []
+    seen = set()
+    for _, _, call in ranked:
+        key = (
+            str(call.get("id") or ""),
+            str(call.get("method") or ""),
+            str(call.get("name") or ""),
+            str(call.get("code") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(call)
+        if len(out) >= max(1, int(limit or 1)):
+            break
+    return out
+    return bool(record and record.get("ok"))
 
 
 def summarize_guard_status(trigger_model_hits, env_guard_eval):
@@ -2564,6 +3961,45 @@ def summarize_guard_status(trigger_model_hits, env_guard_eval):
         "unresolved_guards": unresolved,
         "failed_guards": failed,
     }
+
+
+def apply_manual_evidence(entry, manual_entry):
+    if not manual_entry:
+        entry["manual_evidence"] = None
+        entry["manual_trigger_status"] = None
+        return entry
+
+    manual_status = str(manual_entry.get("status") or "").strip()
+    if manual_status not in {"observable_triggered", "path_triggered"}:
+        entry["manual_evidence"] = manual_entry
+        entry["manual_trigger_status"] = None
+        return entry
+
+    entry["reachable"] = True
+    entry["triggerable"] = "confirmed"
+    entry["triggerable_internal"] = "confirmed"
+    entry["trigger_confidence"] = "manual"
+    entry["manual_evidence"] = manual_entry
+    entry["manual_trigger_status"] = manual_status
+    entry["result_kind"] = map_result_kind(
+        entry.get("triggerable_internal"),
+        entry.get("reachable"),
+        entry.get("assumptions_used"),
+        manual_status=manual_status,
+    )
+    notes = list(entry.get("evidence_notes") or [])
+    summary = str(manual_entry.get("summary") or "").strip()
+    if manual_status == "observable_triggered":
+        notes.append("Manual reproduction recorded: observable vulnerability trigger confirmed.")
+    else:
+        notes.append("Manual reproduction recorded: attacker-controlled input reaches the vulnerable native path.")
+    if summary:
+        notes.append(f"Manual evidence summary: {summary}")
+    artifacts = manual_entry.get("artifacts") or []
+    if artifacts:
+        notes.append(f"Manual evidence artifacts: {artifacts}")
+    entry["evidence_notes"] = notes
+    return entry
 
 
 def clear_supplychain(session):
@@ -2703,6 +4139,12 @@ def build_symbol_usage(session):
         WHERE c.name = s.name
         MERGE (c)-[:USES_SYMBOL]->(s)
     """)
+    # Lift call-level symbol usage to the containing Rust method so wrapper methods
+    # remain discoverable even when the concrete extern call node is missing.
+    session.run("""
+        MATCH (m:METHOD:Rust)-[:CFG|AST*0..40]->(c:CALL:Rust)-[:USES_SYMBOL]->(s:SYMBOL {lang:"C"})
+        MERGE (m)-[:USES_SYMBOL]->(s)
+    """)
 
 def link_c_calls_by_name(session):
     session.run("""
@@ -2729,6 +4171,11 @@ def build_pkg_call(session, root_pkg):
     session.run("""
         MATCH (p1:PACKAGE {name: $root})
         MATCH (c:CALL:C)-[:USES_SYMBOL]->(s:SYMBOL)-[:PROVIDES_SYMBOL]->(p2:PACKAGE)
+        MERGE (p1)-[:PKG_CALL {derived:true}]->(p2)
+    """, root=root_pkg)
+    session.run("""
+        MATCH (p1:PACKAGE {name: $root})
+        MATCH (m:METHOD:Rust {package: $root})-[:USES_SYMBOL]->(s:SYMBOL)-[:PROVIDES_SYMBOL]->(p2:PACKAGE)
         MERGE (p1)-[:PKG_CALL {derived:true}]->(p2)
     """, root=root_pkg)
 
@@ -2785,6 +4232,20 @@ def find_call_chain_to_symbol_usage(session, root_method, symbol):
         RETURN [n IN nodes(p) | {id: n.id, labels: labels(n), name: n.name, code: n.code}] AS chain
         LIMIT 1
     """, root=root_method, sym=symbol).single()
+    return res["chain"] if res else []
+
+def find_call_chain_to_method_symbol_usage(session, root_method, symbol, root_pkg=None):
+    res = session.run("""
+        MATCH (m:METHOD:Rust {name: $root})
+        WHERE $pkg = "" OR coalesce(m.package, "") = $pkg
+        MATCH (target:METHOD:Rust)-[:USES_SYMBOL]->(:SYMBOL {name: $sym, lang:"C"})
+        WHERE $pkg = "" OR coalesce(target.package, "") = $pkg
+        MATCH p=shortestPath((m)-[:CFG|AST|CALL*0..40]->(target))
+        RETURN length(p) AS plen,
+               [n IN nodes(p) | {id: n.id, labels: labels(n), name: n.name, code: n.code}] AS chain
+        ORDER BY plen ASC
+        LIMIT 1
+    """, root=root_method, sym=symbol, pkg=root_pkg or "").single()
     return res["chain"] if res else []
 
 def _normalize_sink_tokens(sink_names):
@@ -2940,11 +4401,32 @@ def find_pkg_call_chain_to_rust_call(session, root_pkg, sink_names):
         pkg=root_pkg,
         sink_tokens=tokens,
     )
+    best_chain = []
+    best_score = None
     for row in rows:
+        call_name = row.get("call_name")
+        call_code = row.get("call_code")
+        chain = list(row.get("chain") or [])
+        root_name = str((chain[0] or {}).get("name") or "") if chain else ""
+        matched = False
+        row_score = _score_public_entry_name(root_name) + _score_public_entry_name(call_name)
+        try:
+            row_score -= int(row.get("plen") or 0)
+        except Exception:
+            pass
         for spec in specs:
-            if _name_matches_sink_token(row.get("call_name"), spec.get("token")) and _sink_spec_matches_text(spec, row.get("call_code")):
-                return row["chain"]
-    return []
+            if _name_matches_sink_token(call_name, spec.get("token")) and _sink_spec_matches_text(spec, call_code):
+                matched = True
+                token = str(spec.get("token") or "")
+                if token:
+                    row_score += 30
+                break
+        if not matched:
+            continue
+        if best_score is None or row_score > best_score:
+            best_score = row_score
+            best_chain = chain
+    return best_chain
 
 
 def find_pkg_method_code_sink(session, root_pkg, sink_names):
@@ -2963,12 +4445,50 @@ def find_pkg_method_code_sink(session, root_pkg, sink_names):
         pkg=root_pkg,
         sink_tokens=tokens,
     )
+    best_node = None
+    best_score = None
     for row in rows:
         node = row["node"]
+        node_name = str(node.get("name") or "")
+        node_code = node.get("code")
+        row_score = _score_public_entry_name(node_name)
+        matched = False
         for spec in specs:
-            if _sink_spec_matches_text(spec, node.get("code")):
-                return [node]
-    return []
+            if _sink_spec_matches_text(spec, node_code):
+                matched = True
+                token = str(spec.get("token") or "")
+                if token and _name_matches_sink_token(node_name, token):
+                    row_score += 40
+                else:
+                    row_score += 10
+                break
+        if not matched:
+            continue
+        if best_score is None or row_score > best_score:
+            best_score = row_score
+            best_node = node
+    return [best_node] if best_node else []
+
+def find_pkg_method_symbol_usage(session, root_pkg, symbol):
+    res = session.run(
+        """
+        MATCH (m:METHOD:Rust {package: $pkg})-[:USES_SYMBOL]->(:SYMBOL {name: $sym, lang:"C"})
+        RETURN {id: m.id, labels: labels(m), name: m.name, code: m.code} AS node
+        LIMIT 40
+        """,
+        pkg=root_pkg,
+        sym=symbol,
+    )
+    best_node = None
+    best_score = None
+    for row in res:
+        node = row.get("node") or {}
+        name = str(node.get("name") or "")
+        score = _score_public_entry_name(name)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_node = node
+    return [best_node] if best_node else []
 
 def extract_function_names(chain_nodes):
     out = []
@@ -3295,6 +4815,8 @@ def collect_source_synthetic_sink_calls(project_dir, sink_names, max_files=4000,
                     if line_end < 0:
                         line_end = len(content)
                     line_text = content[line_start:line_end].strip()
+                    if _looks_like_comment_line(line_text):
+                        continue
                     key_token = (token or spec.get("name_regex") or "").lower()
                     key = (relpath, key_token, line_no)
                     if key in synthetic_seen:
@@ -4915,25 +6437,30 @@ def analyze_triggerability(
     control_nodes=None,
     evidence_calls_override=None,
 ):
-    if not chain_nodes:
-        return {
-            "triggerable": "unknown",
-            "confidence": "none",
-            "evidence_notes": ["No call path analyzed"],
-            "method": None,
-            "call_id": None,
-            "source_calls": [],
-            "sanitizer_calls": [],
-            "trigger_model": {
-                "required_hits": [],
-                "required_miss": [],
-                "mitigations_hit": []
-            }
-        }
-
     evidence = evidence_calls_override or collect_evidence_calls(session, chain_nodes)
-    all_calls = evidence["all_calls"]
-    chain_calls = evidence["chain_calls"]
+    all_calls = list((evidence or {}).get("all_calls") or [])
+    chain_calls = list((evidence or {}).get("chain_calls") or [])
+    evidence_only_mode = False
+
+    if not chain_nodes:
+        if not all_calls:
+            return {
+                "triggerable": "unknown",
+                "confidence": "none",
+                "evidence_notes": ["No call path analyzed"],
+                "method": None,
+                "call_id": None,
+                "source_calls": [],
+                "sanitizer_calls": [],
+                "trigger_model": {
+                    "required_hits": [],
+                    "required_miss": [],
+                    "mitigations_hit": []
+                }
+            }
+        evidence_only_mode = True
+        if not chain_calls:
+            chain_calls = list(all_calls)
 
     context_names = extract_pattern_context(chain_nodes, all_calls)
     sources = match_patterns(context_names, source_patterns)
@@ -4983,7 +6510,7 @@ def analyze_triggerability(
         ratio = hit_required / total_required
         evidence_notes.append(f"Trigger conditions matched: {hit_required}/{total_required}")
         if ratio == 1.0 and not mitigations_hit:
-            confidence = "high"
+            confidence = "medium" if evidence_only_mode else "high"
         elif ratio >= 0.5:
             confidence = "medium"
         else:
@@ -5005,13 +6532,18 @@ def analyze_triggerability(
             confidence = "medium"
 
     if total_required > 0 and hit_required == total_required and not mitigations_hit:
-        triggerable = "confirmed"
+        triggerable = "possible" if evidence_only_mode else "confirmed"
     elif total_required > 0 and hit_required > 0:
         triggerable = "possible"
     elif total_required == 0 and (sources or contexts):
         triggerable = "possible"
     else:
         triggerable = "unknown"
+
+    if evidence_only_mode:
+        evidence_notes.append(
+            "No explicit call-chain path; trigger model evaluated from synthetic/source evidence."
+        )
 
     return {
         "triggerable": triggerable,
@@ -5063,6 +6595,7 @@ def main():
     parser.add_argument("--root", default="", help="Root package name (override deps.root)")
     parser.add_argument("--root-method", default="main", help="Root method name for call chain")
     parser.add_argument("--report", default=DEFAULT_REPORT, help="Output report JSON")
+    parser.add_argument("--manual-evidence", default="", help="Optional JSON with manual trigger evidence to merge into the report")
     parser.add_argument("--sink-kb", default=DEFAULT_SINK_KB, help="Sink knowledge base JSON path")
     parser.add_argument("--cargo-features", default="", help="Extra cargo metadata features (comma/space separated)")
     parser.add_argument("--cargo-all-features", action="store_true", help="Use --all-features for cargo metadata")
@@ -5083,6 +6616,8 @@ def main():
         "edition": None,
         "enabled_features": [],
         "extern_count": 0,
+        "expanded_feature_view": False,
+        "expanded_enabled_features": [],
     }
 
     if args.cargo_dir:
@@ -5093,6 +6628,19 @@ def main():
             cargo_no_default_features=args.cargo_no_default_features,
         )
         deps = build_deps_from_cargo(meta)
+        base_feature_map = _build_feature_map_from_deps(deps)
+        expanded_feature_view = maybe_collect_expanded_feature_deps(
+            args.cargo_dir,
+            meta,
+            cargo_features=args.cargo_features,
+            cargo_all_features=args.cargo_all_features,
+            cargo_no_default_features=args.cargo_no_default_features,
+        )
+        if expanded_feature_view:
+            merge_extras(deps, expanded_feature_view["deps"])
+            _filter_speculative_source_features(deps, base_feature_map)
+            cpg_bootstrap["expanded_feature_view"] = True
+            cpg_bootstrap["expanded_enabled_features"] = list(expanded_feature_view.get("root_enabled_features") or [])
         if args.extras:
             merge_extras(deps, load_json(args.extras))
     else:
@@ -5103,6 +6651,7 @@ def main():
             merge_extras(deps, load_json(args.extras))
     raw_vulns = load_json(args.vulns)
     sink_knowledge = load_sink_knowledge(args.sink_kb)
+    manual_evidence_entries = load_manual_evidence(args.manual_evidence)
     vulns = [normalize_vuln_rule(apply_sink_knowledge(v, sink_knowledge)) for v in raw_vulns]
     root_pkg = args.root or deps.get("root", "app")
     package_versions = collect_package_versions(deps)
@@ -5166,6 +6715,20 @@ def main():
         cpg_bootstrap["imported"] = True
         cpg_bootstrap["cpg_json"] = cpg_json_for_import
 
+    skip_without_fresh_cpg = bool(
+        args.cargo_dir
+        and args.skip_cpg_generation
+        and not args.cpg_json
+        and not cpg_bootstrap.get("imported")
+        and not args.keep_existing_graph
+    )
+    if skip_without_fresh_cpg:
+        print(
+            "[!] skip-cpg-generation enabled without importing a fresh CPG; "
+            "results may otherwise depend on stale graph state.",
+            file=sys.stderr,
+        )
+
     driver = GraphDatabase.driver(URI, auth=AUTH)
     native_source_cache_dir = args.native_source_cache_dir
     if not native_source_cache_dir:
@@ -5183,6 +6746,11 @@ def main():
         with driver.session() as session:
             cpg_stats = get_cpg_stats(session)
             report["cpg_bootstrap"]["stats"] = cpg_stats
+            if skip_without_fresh_cpg and not args.allow_no_cpg:
+                raise RuntimeError(
+                    "Refusing to run with --skip-cpg-generation without a fresh imported CPG "
+                    "(and without --keep-existing-graph)."
+                )
             if (not args.allow_no_cpg) and (
                 cpg_stats.get("rust_methods", 0) <= 0 or cpg_stats.get("rust_calls", 0) <= 0
             ):
@@ -5218,11 +6786,56 @@ def main():
                     args.cargo_dir,
                     rust_sink_candidates,
                 )
+                root_has_bindings_include = _root_has_bindings_include(args.cargo_dir or "")
+                root_is_thin_bindings_gateway = _root_is_thin_bindings_gateway(args.cargo_dir or "")
 
-                dep_chain = find_dep_chain(session, root_pkg, pkg)
-                dep_chain_evidence = find_dep_chain_evidence(session, root_pkg, pkg)
-                dep_reachable = True if dep_chain else False
                 native_component_instances = resolve_native_component_instances(v, package_metadata, args.cargo_dir)
+                dep_match = find_best_dep_chain(
+                    session,
+                    root_pkg,
+                    pkg,
+                    native_component_instances=native_component_instances,
+                )
+                dep_chain = dep_match.get("chain") or []
+                dep_chain_evidence = dep_match.get("edges") or []
+                dep_chain_target = dep_match.get("target")
+                dep_reachable = True if dep_chain else False
+                if not dep_reachable:
+                    root_norm = str(root_pkg or "").strip().lower().replace("_", "-")
+                    root_norm_base = _normalize_native_crate_name(root_norm)
+                    for inst in native_component_instances or []:
+                        evidence_kinds = {
+                            str(item.get("kind") or "")
+                            for item in (inst.get("resolution_evidence") or [])
+                            if isinstance(item, dict)
+                        }
+                        matched_rows = list(inst.get("matched_crates") or [])
+                        root_crate_hit = False
+                        for row in matched_rows:
+                            crate_name = str((row or {}).get("crate") or "").strip().lower().replace("_", "-")
+                            crate_norm = _normalize_native_crate_name(crate_name)
+                            if crate_name == root_norm or (crate_norm and crate_norm == root_norm_base):
+                                root_crate_hit = True
+                                break
+                        if "root_wrapper_probe" in evidence_kinds or root_crate_hit:
+                            dep_reachable = True
+                            if not dep_chain and root_pkg:
+                                dep_chain = [root_pkg]
+                            if not dep_chain_target and root_pkg:
+                                dep_chain_target = root_pkg
+                            if not dep_chain_evidence:
+                                dep_chain_evidence = [
+                                    {
+                                        "from": root_pkg,
+                                        "to": pkg,
+                                        "type": "NATIVE_DEPENDS_ON",
+                                        "evidence_type": "root_wrapper_probe",
+                                        "confidence": "medium",
+                                        "source": "wrapper-fallback",
+                                        "evidence": {"root_wrapper_probe": True},
+                                    }
+                                ]
+                            break
 
                 for sym in symbols:
                     source_status, has_method = get_symbol_status(session, sym)
@@ -5264,6 +6877,15 @@ def main():
                         call_chain_nodes = find_call_chain_to_symbol_usage(session, args.root_method, sym)
                         if call_chain_nodes:
                             call_reachability_source = "c_symbol_usage"
+                    if not call_chain_nodes:
+                        call_chain_nodes = find_call_chain_to_method_symbol_usage(
+                            session,
+                            args.root_method,
+                            sym,
+                            root_pkg=root_pkg,
+                        )
+                        if call_chain_nodes:
+                            call_reachability_source = "c_method_symbol_usage"
                     if not call_chain_nodes and rust_sink_candidates:
                         call_chain_nodes = find_call_chain_to_rust_call(
                             session,
@@ -5282,6 +6904,20 @@ def main():
                         )
                         if call_chain_nodes:
                             call_reachability_source = "rust_method_root"
+                    crate_aliases = []
+                    for instance in native_component_instances or []:
+                        for row in instance.get("matched_crates") or []:
+                            crate_aliases.extend(_candidate_native_crate_aliases(row.get("crate")))
+                    crate_aliases.extend(_candidate_native_crate_aliases(pkg))
+                    package_native_gateway_calls = collect_package_native_gateway_calls(
+                        session,
+                        root_pkg,
+                        crate_aliases,
+                    )
+                    source_native_gateway_calls = collect_source_native_gateway_calls(
+                        args.cargo_dir or "",
+                        crate_aliases,
+                    )
                     if not call_chain_nodes and rust_sink_candidates:
                         call_chain_nodes = find_call_chain_to_rust_method_code_sink(
                             session,
@@ -5307,6 +6943,82 @@ def main():
                         )
                         if call_chain_nodes:
                             call_reachability_source = "rust_method_code_package"
+                    if not call_chain_nodes:
+                        call_chain_nodes = find_pkg_method_symbol_usage(
+                            session,
+                            root_pkg,
+                            sym,
+                        )
+                        if call_chain_nodes:
+                            call_reachability_source = "c_method_symbol_usage_package"
+
+                    relevant_gateway_calls = select_relevant_native_gateway_calls(
+                        list(package_native_gateway_calls or []) + list(source_native_gateway_calls or []),
+                        symbol=sym,
+                        sink_candidates=rust_sink_candidates,
+                        limit=2,
+                    )
+                    relevant_synthetic_calls = select_relevant_native_gateway_calls(
+                        list(package_synthetic_sink_calls or []) + list(source_synthetic_sink_calls or []),
+                        symbol=sym,
+                        sink_candidates=rust_sink_candidates,
+                        limit=2,
+                    )
+                    bindings_gateway_calls = []
+                    if (
+                        not call_chain_nodes
+                        and not relevant_synthetic_calls
+                        and root_has_bindings_include
+                        and (root_is_thin_bindings_gateway or str(root_pkg or "").lower().endswith(("sys", "-sys", "_sys")))
+                    ):
+                        bindings_gateway_calls = [
+                            {
+                                "id": f"bindingsgw:{root_pkg}:{sym}",
+                                "name": sym,
+                                "code": f"pub fn {sym}(...)",
+                                "lang": "Rust",
+                                "method": "bindings_gateway",
+                                "scope": "synthetic_bindings_gateway",
+                            }
+                        ]
+                    if relevant_gateway_calls and (
+                        not call_chain_nodes
+                        or _is_weak_rust_code_reachability_source(call_reachability_source)
+                    ):
+                        gateway_seed = relevant_gateway_calls
+                        call_chain_nodes = [
+                            {
+                                "id": call.get("id"),
+                                "labels": ["METHOD", "Rust"],
+                                "name": call.get("method") or call.get("name"),
+                                "code": call.get("code"),
+                            }
+                            for call in gateway_seed
+                        ]
+                        if call_chain_nodes:
+                            call_reachability_source = "rust_native_gateway_package"
+                    if not call_chain_nodes and relevant_synthetic_calls:
+                        call_chain_nodes = [
+                            {
+                                "id": call.get("id"),
+                                "labels": ["METHOD", "Rust"],
+                                "name": call.get("method") or call.get("name"),
+                                "code": call.get("code"),
+                            }
+                            for call in relevant_synthetic_calls
+                        ]
+                        if call_chain_nodes:
+                            call_reachability_source = "rust_synthetic_sink_seed"
+                    if not call_chain_nodes and bindings_gateway_calls:
+                        call_chain_nodes = [
+                            {
+                                "id": f"bindings_gateway:{root_pkg}:{sym}",
+                                "labels": ["METHOD", "Rust"],
+                                "name": "bindings_gateway",
+                                "code": 'include!(concat!(env!("OUT_DIR"), "/bindings.rs"));',
+                            }
+                        ]
+                        call_reachability_source = "rust_bindings_gateway_root"
 
                     call_reachable = True if call_chain_nodes else False
                     call_chain = [n.get("name") or n.get("code") for n in call_chain_nodes if n.get("name") or n.get("code")]
@@ -5320,6 +7032,9 @@ def main():
                     evidence_calls = merge_evidence_calls(evidence_calls, synthetic_sink_calls)
                     evidence_calls = merge_evidence_calls(evidence_calls, package_synthetic_sink_calls)
                     evidence_calls = merge_evidence_calls(evidence_calls, source_synthetic_sink_calls)
+                    evidence_calls = merge_evidence_calls(evidence_calls, package_native_gateway_calls)
+                    evidence_calls = merge_evidence_calls(evidence_calls, source_native_gateway_calls)
+                    evidence_calls = merge_evidence_calls(evidence_calls, bindings_gateway_calls)
                     ffi_semantics = build_ffi_semantics(evidence_calls["all_calls"])
 
                     analysis_context = {
@@ -5380,7 +7095,10 @@ def main():
                             analysis_context=analysis_context,
                         )
 
-                    env_guard_blocked = bool(env_guard_eval.get("failed"))
+                    failed_guard_items = list(env_guard_eval.get("failed") or [])
+                    version_guard_failed_items = [item for item in failed_guard_items if item.get("kind") == "version_range"]
+                    env_guard_failed_items = [item for item in failed_guard_items if item.get("kind") != "version_range"]
+                    env_guard_blocked = bool(version_guard_failed_items or env_guard_failed_items)
                     input_predicate_eval = evaluate_input_predicate(
                         v,
                         call_chain_nodes,
@@ -5398,9 +7116,16 @@ def main():
                         control_nodes=control_structures,
                         evidence_calls_override=evidence_calls,
                     )
-                    if call_reachability_source and call_reachability_source.startswith("rust_"):
+                    if call_reachability_source and (
+                        call_reachability_source.startswith("rust_")
+                        or "symbol_usage" in call_reachability_source
+                    ):
                         trig["evidence_notes"].append(
                             f"Call reachability inferred via {call_reachability_source}."
+                        )
+                    if dep_chain_target and dep_chain_target != pkg:
+                        trig["evidence_notes"].append(
+                            f"Dependency reachability established via matched native crate: {dep_chain_target} -> {pkg}."
                         )
                     if synthetic_sink_calls:
                         trig["evidence_notes"].append(
@@ -5541,11 +7266,68 @@ def main():
                     wrapper_sink_evidence = bool(
                         synthetic_sink_calls or package_synthetic_sink_calls or source_synthetic_sink_calls
                     )
+                    explicit_native_symbol_bridge = has_explicit_native_symbol_bridge(
+                        sym,
+                        list(synthetic_sink_calls or [])
+                        + list(package_synthetic_sink_calls or [])
+                        + list(source_synthetic_sink_calls or []),
+                    )
+                    gateway_symbols = []
+                    for gateway_call in list(package_native_gateway_calls or []) + list(source_native_gateway_calls or []):
+                        gateway_name = str(gateway_call.get("name") or "").strip()
+                        if gateway_name and gateway_name not in gateway_symbols:
+                            gateway_symbols.append(gateway_name)
+                    dependency_source_symbol_bridge = has_dependency_source_symbol_bridge(
+                        sym,
+                        deps,
+                        crate_hints=((v.get("match") or {}).get("crates") or []),
+                    )
+                    transitive_native_symbol_bridge = has_transitive_native_symbol_bridge(
+                        session,
+                        pkg,
+                        gateway_symbols,
+                        sym,
+                    )
                     wrapper_input_satisfied = input_predicate_eval.get("status") == "satisfied"
+                    native_cross_language_evidence = has_cross_language_native_evidence(
+                        source_status=source_status,
+                        call_reachability_source=call_reachability_source,
+                        has_method=has_method,
+                        strict_callsite_edges=strict_callsite_edges,
+                        native_analysis_coverage=native_analysis_coverage,
+                        native_dependency_imports=native_dependency_imports,
+                        strict_dependency_resolution=strict_dependency_resolution,
+                    ) or explicit_native_symbol_bridge or dependency_source_symbol_bridge or transitive_native_symbol_bridge
+                    conservative_wrapper_reachability = (
+                        not reachable
+                        and call_reachable
+                        and bool(native_component_instances)
+                        and preserve_binary_decision
+                        and source_status in {"stub", "binary-only", "system", "downloaded-official"}
+                        and call_reachability_source in {
+                            "rust_call_root",
+                            "rust_method_root",
+                            "rust_method_code_root",
+                            "rust_call_package",
+                            "rust_method_code_package",
+                            "rust_native_gateway_package",
+                            "c_method_symbol_usage_package",
+                        }
+                        and (wrapper_sink_evidence or native_cross_language_evidence)
+                    )
+                    if conservative_wrapper_reachability:
+                        reachable = True
+                        trig["evidence_notes"].append(
+                            "Reachability preserved via conservative Rust-wrapper/native bridge despite missing dependency-chain edge."
+                        )
+                        downgrade_reason = _append_reason(
+                            downgrade_reason,
+                            "reachable_via_wrapper_bridge_without_dep_chain",
+                        )
                     if source_status in ["stub", "binary-only", "system"]:
-                        if reachable and preserve_binary_decision:
+                        if reachable and preserve_binary_decision and native_cross_language_evidence:
                             triggerable = trig["triggerable"]
-                            downgrade_reason = f"source_status={source_status};preserved_by_rust_trigger_evidence"
+                            downgrade_reason = f"source_status={source_status};preserved_by_cross_language_trigger_evidence"
                         elif reachable and wrapper_sink_evidence and wrapper_input_satisfied:
                             triggerable = "possible"
                             downgrade_reason = f"source_status={source_status};preserved_by_wrapper_sink_evidence"
@@ -5558,7 +7340,12 @@ def main():
                         else:
                             triggerable = "unreachable"
 
-                    if reachable and env_guard_eval.get("failed"):
+                    if reachable and version_guard_failed_items:
+                        triggerable = "false_positive"
+                        downgrade_reason = _append_reason(downgrade_reason, "version_guard_unsatisfied")
+                        trig["evidence_notes"].append("Version range guard is unsatisfied; marked as false positive.")
+
+                    if reachable and env_guard_failed_items:
                         triggerable = "false_positive"
                         downgrade_reason = _append_reason(downgrade_reason, "env_guard_unsatisfied")
                         trig["evidence_notes"].append("Environment guards are unsatisfied; marked as false positive.")
@@ -5596,7 +7383,11 @@ def main():
                         else:
                             trig["evidence_notes"].append("Existential input model satisfied using observed code lengths.")
 
-                    if reachable and native_analysis_coverage in {"none", "target_only_incomplete"}:
+                    if (
+                        reachable
+                        and native_analysis_coverage in {"none", "target_only_incomplete"}
+                        and not explicit_native_symbol_bridge
+                    ):
                         if triggerable == "confirmed":
                             triggerable = "possible"
                         downgrade_reason = _append_reason(downgrade_reason, "native_dependency_graph_incomplete")
@@ -5614,12 +7405,24 @@ def main():
                         reachable
                         and source_status in ["stub", "binary-only", "system"]
                         and triggerable == "confirmed"
-                        and strict_callsite_edges <= 0
+                        and not native_cross_language_evidence
                     ):
                         triggerable = "possible"
-                        downgrade_reason = _append_reason(downgrade_reason, "no_callsite_level_native_resolution")
+                        downgrade_reason = _append_reason(downgrade_reason, "cross_language_native_evidence_missing")
                         trig["evidence_notes"].append(
-                            "Strict native resolution did not reach callsite level; downgraded from confirmed to possible."
+                            "Cross-language native evidence is insufficient; downgraded from confirmed to possible."
+                        )
+                    elif reachable and explicit_native_symbol_bridge:
+                        trig["evidence_notes"].append(
+                            f"Cross-language bridge satisfied by explicit native symbol reference in Rust wrapper: {sym}."
+                        )
+                    elif reachable and dependency_source_symbol_bridge:
+                        trig["evidence_notes"].append(
+                            f"Cross-language bridge satisfied by dependency wrapper source referencing native symbol: {sym}."
+                        )
+                    elif reachable and transitive_native_symbol_bridge:
+                        trig["evidence_notes"].append(
+                            f"Cross-language bridge satisfied transitively via native gateway symbol(s): {', '.join(gateway_symbols[:6])} -> {sym}."
                         )
 
                     if path_solver_enabled:
@@ -5674,6 +7477,12 @@ def main():
                         trig["confidence"] = "low"
 
                     triggerable_internal = triggerable
+                    manual_entry = select_manual_evidence(
+                        manual_evidence_entries,
+                        cve=cve,
+                        package=pkg,
+                        symbol=sym,
+                    )
                     result_kind = map_result_kind(triggerable_internal, reachable, assumptions_used)
                     guard_summary = summarize_guard_status(trig.get("trigger_model", {}), env_guard_eval)
                     prune_not_triggered = (
@@ -5687,7 +7496,7 @@ def main():
                     constraint_result["input_predicate_eval"] = input_predicate_eval
                     constraint_result["prune_not_triggered"] = prune_not_triggered
 
-                    report["vulnerabilities"].append({
+                    report_entry = {
                         "cve": cve,
                         "package": pkg,
                         "version_range": vrange,
@@ -5716,6 +7525,7 @@ def main():
                         "source_status": source_status,
                         "downgrade_reason": downgrade_reason,
                         "dependency_chain": dep_chain,
+                        "dependency_chain_target": dep_chain_target,
                         "dependency_chain_evidence": dep_chain_evidence,
                         "call_chain": call_chain,
                         "call_chain_nodes": call_chain_nodes,
@@ -5764,7 +7574,8 @@ def main():
                             "ffi_call_id": trig["call_id"],
                             "method": trig["method"]
                         }
-                    })
+                    }
+                    report["vulnerabilities"].append(apply_manual_evidence(report_entry, manual_entry))
 
             deduped_native_bootstrap = []
             seen_native_bootstrap = set()
