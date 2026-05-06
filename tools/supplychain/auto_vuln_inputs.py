@@ -76,6 +76,59 @@ def _match_crates(item: dict[str, Any], defaults: list[str]) -> list[str]:
     return crates
 
 
+def _lockfile_package_names(project_dir: str | Path | None) -> set[str]:
+    root = Path(str(project_dir or "")).resolve() if project_dir else None
+    if not root or not root.exists():
+        return set()
+    cargo_lock = root / "Cargo.lock"
+    if not cargo_lock.exists():
+        return set()
+    try:
+        text = cargo_lock.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return set()
+    return {
+        str(match.group(1) or "").strip()
+        for match in re.finditer(r'(?m)^\s*name\s*=\s*"([^"]+)"', text)
+        if str(match.group(1) or "").strip()
+    }
+
+
+def _strong_native_dep_crates(component: str, meta: dict[str, Any]) -> set[str]:
+    strong = set()
+    component_name = str(component or "").strip()
+    if component_name:
+        strong.add(component_name)
+    for crate in meta.get("sys_crates") or []:
+        text = str(crate or "").strip()
+        if text:
+            strong.add(text)
+    return strong
+
+
+def _has_strong_native_dep_evidence(item: dict[str, Any], component: str, meta: dict[str, Any]) -> bool:
+    strong_crates = {str(crate or "").strip() for crate in _strong_native_dep_crates(component, meta) if str(crate or "").strip()}
+    if not strong_crates:
+        return False
+
+    dep_evidence = item.get("dependency_evidence")
+    if isinstance(dep_evidence, dict):
+        dep_iter = [dep_evidence]
+    elif isinstance(dep_evidence, list):
+        dep_iter = dep_evidence
+    else:
+        dep_iter = []
+    for dep in dep_iter:
+        if not isinstance(dep, dict):
+            continue
+        crate = str((dep or {}).get("crate") or "").strip()
+        if crate and crate in strong_crates:
+            return True
+
+    package_names = _lockfile_package_names(item.get("project_dir"))
+    return bool(package_names & strong_crates)
+
+
 def _generic_description(item: dict[str, Any], component: str, detail: str) -> str:
     source = item.get("source_label") or "auto-generated family rule"
     return f"{detail} ({item.get('project') or 'project'}; {component}; {source})."
@@ -993,16 +1046,12 @@ def generate_extras_payload(item: dict[str, Any]) -> dict[str, Any]:
     component = FAMILY_COMPONENTS.get(family)
     if not component:
         raise KeyError(f"No auto extras template for family={family!r}")
+    meta = _component_meta(family)
     project_name = item.get("project") or Path(str(item.get("project_dir") or "")).name
     source_label = item.get("source_label") or "auto-generated family rule"
-    return {
-        "packages": [
-            {
-                "name": component,
-                "lang": "C",
-            }
-        ],
-        "depends": [
+    depends = []
+    if _has_strong_native_dep_evidence(item, component, meta):
+        depends.append(
             {
                 "from": project_name,
                 "to": component,
@@ -1011,5 +1060,13 @@ def generate_extras_payload(item: dict[str, Any]) -> dict[str, Any]:
                 "source": source_label,
                 "evidence": f"root package uses native component {component}",
             }
+        )
+    return {
+        "packages": [
+            {
+                "name": component,
+                "lang": "C",
+            }
         ],
+        "depends": depends,
     }

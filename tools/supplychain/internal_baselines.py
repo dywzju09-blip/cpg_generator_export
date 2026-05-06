@@ -121,6 +121,49 @@ def _yes_no_unknown(value: bool | None) -> str:
     return "unknown"
 
 
+def _has_wrapper_sink_evidence(vuln: Mapping[str, Any]) -> bool:
+    package_name = str(vuln.get("package") or "").strip().lower().replace("_", "-")
+    source = str(vuln.get("call_reachability_source") or "").strip()
+    if (
+        package_name == "libjpeg-turbo"
+        and source == "rust_native_gateway_package"
+        and not _has_required_trigger_hit(vuln, "jpeg_header_any")
+    ):
+        return False
+    downgrade_reason = str(vuln.get("downgrade_reason") or "").strip()
+    if "preserved_by_wrapper_sink_evidence" in downgrade_reason:
+        return True
+    if "direct_native_gateway_bridge" in downgrade_reason:
+        return True
+    for note in vuln.get("evidence_notes") or []:
+        note_text = str(note or "").strip().lower()
+        if "explicit native symbol reference in rust wrapper" in note_text:
+            return True
+        if "direct native gateway calls recovered" in note_text:
+            return True
+    return False
+
+
+def _required_trigger_hits(vuln: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    conditions = vuln.get("conditions")
+    if not isinstance(conditions, Mapping):
+        return []
+    trigger_model_hits = conditions.get("trigger_model_hits")
+    if not isinstance(trigger_model_hits, Mapping):
+        return []
+    hits = trigger_model_hits.get("required_hits")
+    if not isinstance(hits, list):
+        return []
+    return [item for item in hits if isinstance(item, Mapping)]
+
+
+def _has_required_trigger_hit(vuln: Mapping[str, Any], hit_id: str) -> bool:
+    wanted = str(hit_id or "").strip()
+    if not wanted:
+        return False
+    return any(str(item.get("id") or "").strip() == wanted for item in _required_trigger_hits(vuln))
+
+
 @dataclass(frozen=True)
 class ProjectionSupport:
     dependency_hit: str
@@ -171,6 +214,8 @@ def support_from_vulnerability(vuln: Mapping[str, Any]) -> ProjectionSupport:
         strict_dependency_resolution=vuln.get("strict_dependency_resolution") or {},
     )
     if manual_trigger_status in {"observable_triggered", "path_triggered"}:
+        cross_language_linked = True
+    elif _has_wrapper_sink_evidence(vuln):
         cross_language_linked = True
 
     return ProjectionSupport(
@@ -239,9 +284,71 @@ def project_ours_full_from_support(
         if not run_status:
             run_status = "triggerable_confirmed"
     elif support.triggerable == "possible":
-        predicted_label = "triggerable"
+        predicted_label = "reachable_but_not_triggerable"
         risk_level = "medium"
+        native_internal_satisfied = "partial"
+        if not run_status:
+            run_status = "triggerable_possible"
+    elif support.reachable is True or support.result_kind == "Reachable" or support.triggerable == "false_positive":
+        predicted_label = "reachable_but_not_triggerable"
+        risk_level = "medium"
+        native_internal_satisfied = "no"
+        if not run_status:
+            run_status = "reachable_only"
+    elif support.triggerable == "unreachable" or support.reachable is False:
+        predicted_label = "unreachable"
+        risk_level = "low"
+        native_internal_satisfied = "no"
+        if not run_status:
+            run_status = "not_reachable"
+
+    correct = ""
+    if gold_label and predicted_label:
+        correct = "yes" if gold_label == predicted_label else "no"
+
+    return {
+        "gold_label": gold_label,
+        "predicted_label": predicted_label,
+        "correct": correct,
+        "risk_level": risk_level,
+        "dependency_hit": support.dependency_hit,
+        "version_hit": support.version_hit,
+        "rust_reachable": support.rust_reachable,
+        "cross_language_linked": support.cross_language_linked,
+        "native_internal_satisfied": native_internal_satisfied,
+        "degraded": degraded,
+        "run_status": run_status,
+        "error_type": error_type,
+    }
+
+
+def project_ours_accuracy_first_from_support(
+    support: ProjectionSupport,
+    *,
+    gold_label: str = "",
+    run_status: str = "",
+    degraded: str = "no",
+    error_type: str = "",
+) -> dict[str, str]:
+    predicted_label = ""
+    risk_level = ""
+    native_internal_satisfied = "unknown"
+    if support.manual_trigger_status in {"observable_triggered", "path_triggered"}:
+        predicted_label = "triggerable"
+        risk_level = "high"
         native_internal_satisfied = "yes"
+        if not run_status:
+            run_status = support.manual_trigger_status
+    elif support.triggerable == "confirmed":
+        predicted_label = "triggerable"
+        risk_level = "high"
+        native_internal_satisfied = "yes"
+        if not run_status:
+            run_status = "triggerable_confirmed"
+    elif support.triggerable == "possible":
+        predicted_label = "reachable_but_not_triggerable"
+        risk_level = "medium"
+        native_internal_satisfied = "partial"
         if not run_status:
             run_status = "triggerable_possible"
     elif support.reachable is True or support.result_kind == "Reachable" or support.triggerable == "false_positive":

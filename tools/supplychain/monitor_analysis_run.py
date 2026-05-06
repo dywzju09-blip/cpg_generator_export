@@ -105,14 +105,38 @@ ENV_RULES = [
         "reason": "libwebp headers/libs missing",
     },
     {
-        "patterns": [r"\bft2build\.h\b", r"\bfreetype\b", r"\bfreetype-sys\b"],
-        "packages": ["libfreetype6-dev", "pkg-config"],
+        "patterns": [r"\bft2build\.h\b", r"\bfreetype\b", r"\bfreetype-sys\b", r"\bfreetype2\b", r"\bfreetype2\.pc\b"],
+        "packages": ["libfreetype-dev", "libfreetype6-dev", "pkg-config"],
         "reason": "FreeType headers/libs missing",
+    },
+    {
+        "patterns": [r"\bGL/glu\.h\b", r"\bglu\.h\b", r"\blibglu\b", r"\bmesa\b"],
+        "packages": ["libglu1-mesa-dev", "libgl1-mesa-dev"],
+        "reason": "GLU/OpenGL headers missing",
     },
     {
         "patterns": [r"\bxmlsec1-config\b", r"\bxmlsec1\b", r"\blibxmlsec1\b"],
         "packages": ["libxmlsec1-dev", "pkg-config"],
         "reason": "xmlsec headers/libs missing",
+    },
+    {
+        "patterns": [
+            r"\bgtk4\.pc\b",
+            r"\bgtk4\b.*not found",
+            r"\bgtk4-sys\b",
+            r"\bgdk4-sys\b",
+            r"\bgsk4-sys\b",
+            r"\blibadwaita-1\b",
+            r"\badw\b",
+        ],
+        "packages": [
+            "libgtk-4-dev",
+            "libadwaita-1-dev",
+            "libgstreamer1.0-dev",
+            "libgstreamer-plugins-base1.0-dev",
+            "pkg-config",
+        ],
+        "reason": "GTK4/libadwaita/GStreamer headers/libs missing",
     },
 ]
 
@@ -192,6 +216,7 @@ def apt_install(packages: list[str]) -> list[str]:
     else:
         installed_now.append(f"apt-install-failed: {','.join(missing)}")
         log_path = Path("/root/VUL/2026.3.22/monitor_hourly_install_errors.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(f"\n[{datetime.now(timezone.utc).isoformat()}]\n{output}\n")
     return installed_now

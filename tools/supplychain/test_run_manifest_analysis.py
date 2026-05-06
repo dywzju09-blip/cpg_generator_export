@@ -8,6 +8,7 @@ from unittest.mock import patch
 from tools.supplychain.run_manifest_analysis import (
     extract_summary_fields,
     prepare_vulns_input,
+    run_one,
     validate_analysis_runtime,
 )
 
@@ -139,6 +140,51 @@ class RunManifestAnalysisTests(unittest.TestCase):
         self.assertIn("analysis runtime check failed", error)
         self.assertIn("neo4j", error)
         self.assertIn("/usr/bin/python3", error)
+
+    def test_run_one_treats_sigterm_before_report_as_timeout(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            vulns = root / "vulns.json"
+            vulns.write_text(
+                json.dumps(
+                    [
+                        {
+                            "cve": "CVE-2099-0001",
+                            "package": "demo",
+                            "symbol": "demo_sink",
+                            "version_range": "*",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            item = {
+                "rel": "cases/demo",
+                "project_dir": str(project),
+                "project": "demo",
+                "version": "0.1.0",
+                "family": "demo",
+                "component": "demo",
+                "cve_dir": "CVE-2099-0001__demo",
+                "vulns": str(vulns),
+                "root_method": "main",
+            }
+            with patch(
+                "tools.supplychain.run_manifest_analysis.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=["supplychain_analyze.py"],
+                    returncode=-15,
+                    stdout="",
+                    stderr="",
+                ),
+            ):
+                entry = run_one(item, root / "run", timeout_seconds=3600)
+            log_text = Path(entry["log"]).read_text(encoding="utf-8")
+            self.assertEqual(entry["exit_code"], -15)
+            self.assertEqual(entry["status"], "analysis_timeout")
+            self.assertIn("terminated by SIGTERM", log_text)
 
 
 if __name__ == "__main__":

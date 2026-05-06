@@ -24,6 +24,9 @@ __pycache__/
 
 # Project specific
 output/
+.codex
+PAPER_DATA/
+PAPER_DATA_NONFINAL_ARCHIVE_2026-04-27_UTC/
 # Ignore generated CPGs if they appear outside output
 cpg_export/
 *.json

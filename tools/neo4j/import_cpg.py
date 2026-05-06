@@ -12,11 +12,27 @@ if str(REPO_ROOT) not in sys.path:
 from tools.neo4j.config import neo4j_auth, neo4j_uri
 
 DEFAULT_BATCH_SIZE = 1000
+DEFAULT_CLEAR_BATCH_SIZE = 10000
 
 
 def chunked(items, size):
     for idx in range(0, len(items), size):
         yield items[idx: idx + size]
+
+
+def clear_database_batched(session, batch_size=DEFAULT_CLEAR_BATCH_SIZE):
+    print(f"Clearing database in batches of {batch_size} nodes...")
+    total_deleted = 0
+    while True:
+        result = session.run(
+            f"MATCH (n) WITH n LIMIT {int(batch_size)} DETACH DELETE n RETURN count(n) AS deleted"
+        )
+        deleted = int(result.single()["deleted"])
+        total_deleted += deleted
+        if deleted == 0:
+            break
+        print(f"Cleared {total_deleted} nodes...")
+    print(f"Database clear finished; deleted {total_deleted} nodes.")
 
 
 def import_json_to_neo4j(json_file, clear_db, id_offset, label_tag):
@@ -36,8 +52,7 @@ def import_json_to_neo4j(json_file, clear_db, id_offset, label_tag):
     with driver.session() as session:
         # Optional: Clear database
         if clear_db:
-            print("Clearing database...")
-            session.run("MATCH (n) DETACH DELETE n")
+            clear_database_batched(session)
         else:
             print("Incremental import (DB not cleared).")
 
@@ -91,7 +106,7 @@ def import_json_to_neo4j(json_file, clear_db, id_offset, label_tag):
         edge_query_template = (
             "UNWIND $rows AS row "
             f"MATCH {node_match} "
-            "MERGE (a)-[r:`__EDGE_TYPE__`]->(b) "
+            "CREATE (a)-[r:`__EDGE_TYPE__`]->(b) "
             "SET r += row.props"
         )
         for edge_type, rows in edges_by_type.items():

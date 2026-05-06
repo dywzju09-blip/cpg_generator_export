@@ -130,7 +130,7 @@ class DeriveInternalBaselinesTests(unittest.TestCase):
             result_rows = read_csv(index / "results.csv")
             self.assertEqual({row["method"] for row in result_rows}, {"Ours-Full", "BL-Dep", "BL-Dep+Reach", "BL-NoNativeInternal"})
             by_method = {row["method"]: row for row in result_rows}
-            self.assertEqual(by_method["Ours-Full"]["predicted_label"], "triggerable")
+            self.assertEqual(by_method["Ours-Full"]["predicted_label"], "reachable_but_not_triggerable")
             self.assertEqual(by_method["BL-Dep"]["predicted_label"], "reachable_but_not_triggerable")
             self.assertEqual(by_method["BL-Dep+Reach"]["predicted_label"], "reachable_but_not_triggerable")
             self.assertEqual(by_method["BL-NoNativeInternal"]["predicted_label"], "triggerable")

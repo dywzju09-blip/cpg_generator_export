@@ -284,7 +284,14 @@ def validate_analysis_runtime(python_executable: str) -> str | None:
     )
 
 
-def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_source_supplement: bool = False) -> list[str]:
+def build_command(
+    item: dict[str, Any],
+    run_case_dir: Path,
+    *,
+    disable_native_source_supplement: bool = False,
+    native_source_cache_dir: str = "",
+    disable_component_cpg_reuse: bool = False,
+) -> list[str]:
     inputs_dir = run_case_dir / "analysis_inputs"
     report_path = run_case_dir / "analysis_report.json"
     cmd = [
@@ -301,6 +308,8 @@ def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_so
     ]
     if item.get("root"):
         cmd.extend(["--root", str(item["root"])])
+    if item.get("deps"):
+        cmd.extend(["--deps", str(item["deps"])])
     if item.get("cpg_input"):
         cmd.extend(["--cpg-input", str(item["cpg_input"])])
     if item.get("cpg_json"):
@@ -317,6 +326,10 @@ def build_command(item: dict[str, Any], run_case_dir: Path, *, disable_native_so
         cmd.append("--cargo-no-default-features")
     if disable_native_source_supplement:
         cmd.append("--disable-native-source-supplement")
+    if native_source_cache_dir:
+        cmd.extend(["--native-source-cache-dir", str(native_source_cache_dir)])
+    if disable_component_cpg_reuse:
+        cmd.append("--disable-component-cpg-reuse")
     return cmd
 
 
@@ -392,6 +405,8 @@ def run_one(
     timeout_seconds: int,
     *,
     disable_native_source_supplement: bool = False,
+    native_source_cache_dir: str = "",
+    disable_component_cpg_reuse: bool = False,
 ) -> dict[str, Any]:
     case_dir = run_root / run_dir_name(item)
     ensure_dir(case_dir / "analysis_inputs")
@@ -405,6 +420,7 @@ def run_one(
             encoding="utf-8",
         )
         return {
+            "case_id": item.get("case_id") or "",
             "rel": item["rel"],
             "project": item["project"],
             "version": item["version"],
@@ -436,6 +452,7 @@ def run_one(
         log_path = case_dir / "run.log"
         log_path.write_text(f"{vulns_error}\n", encoding="utf-8")
         return {
+            "case_id": item.get("case_id") or "",
             "rel": item["rel"],
             "project": item["project"],
             "version": item["version"],
@@ -459,6 +476,8 @@ def run_one(
         item,
         case_dir,
         disable_native_source_supplement=disable_native_source_supplement,
+        native_source_cache_dir=native_source_cache_dir,
+        disable_component_cpg_reuse=disable_component_cpg_reuse,
     )
     start = time.time()
     exit_code = 1
@@ -495,6 +514,17 @@ def run_one(
         summary["reachable"] = False
         summary["triggerable"] = None
         summary["result_kind"] = None
+    elif exit_code == -15 and summary["status"] == "analysis_failed":
+        stderr = (
+            f"{stderr.rstrip()}\n"
+            "Process terminated by SIGTERM before report generation; "
+            "treating as analysis_timeout so the batch runner can retry with an expanded window."
+        ).lstrip("\n")
+        log_path.write_text(f"$ {' '.join(cmd)}\n\n[stdout]\n{stdout}\n\n[stderr]\n{stderr}\n", encoding="utf-8")
+        summary["status"] = "analysis_timeout"
+        summary["reachable"] = False
+        summary["triggerable"] = None
+        summary["result_kind"] = None
     elif validation_error:
         summary["status"] = "analysis_failed"
         summary["reachable"] = False
@@ -506,6 +536,7 @@ def run_one(
         summary["result_kind"] = None
 
     return {
+        "case_id": item.get("case_id") or "",
         "rel": item["rel"],
         "project": item["project"],
         "version": item["version"],
@@ -555,6 +586,7 @@ def write_run_summary(run_root: Path, manifest_path: Path, entries: list[dict[st
         run_root / "manifest.json",
         [
             {
+                "case_id": entry.get("case_id") or "",
                 "rel": entry["rel"],
                 "project_dir": entry["project_dir"],
                 "run_dir": entry["run_dir"],
@@ -577,6 +609,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", required=True, help="Run name, used under output/vulnerability_runs/<run-name>")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT), help="Base directory for temporary run output")
     parser.add_argument("--timeout-seconds", type=int, default=900, help="Per-project timeout in seconds")
+    parser.add_argument(
+        "--component-cpg-reuse-mode",
+        default="legacy",
+        choices=["legacy", "with-reuse", "without-reuse"],
+        help="Component CPG reuse strategy: legacy uses per-case caches; with-reuse shares cache dir and reuses JSON; without-reuse shares cache dir but forces regeneration.",
+    )
+    parser.add_argument(
+        "--shared-native-source-cache-dir",
+        default="",
+        help="Shared cache directory for native sources and component CPG JSON files (used when component-cpg-reuse-mode != legacy).",
+    )
     parser.add_argument(
         "--archive-dest-root",
         default="",
@@ -609,6 +652,13 @@ def main() -> int:
     normalized = [normalize_item(item) for item in items]
     entries = []
     total = len(normalized)
+
+    shared_native_cache_dir = ""
+    if args.component_cpg_reuse_mode != "legacy":
+        shared_native_cache_dir = args.shared_native_source_cache_dir.strip()
+        if not shared_native_cache_dir:
+            shared_native_cache_dir = str((run_root / "shared_native_cache").resolve())
+
     for idx, item in enumerate(normalized, start=1):
         print(f"[{idx}/{total}] analyzing {item['project']} ({item['cve_dir']})", flush=True)
         entry = run_one(
@@ -616,6 +666,8 @@ def main() -> int:
             run_root,
             args.timeout_seconds,
             disable_native_source_supplement=args.disable_native_source_supplement,
+            native_source_cache_dir=shared_native_cache_dir,
+            disable_component_cpg_reuse=(args.component_cpg_reuse_mode == "without-reuse"),
         )
         entries.append(entry)
         print(

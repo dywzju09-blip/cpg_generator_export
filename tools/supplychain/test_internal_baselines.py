@@ -5,6 +5,7 @@ from tools.supplychain.internal_baselines import (
     BL_DEP_REACH,
     BL_NO_NATIVE_INTERNAL,
     project_internal_baseline,
+    project_ours_accuracy_first_from_support,
     project_ours_full_from_support,
     support_from_vulnerability,
 )
@@ -93,7 +94,7 @@ class InternalBaselinesTests(unittest.TestCase):
         projected = project_internal_baseline(BL_NO_NATIVE_INTERNAL, support)
         self.assertEqual(projected["predicted_label"], "triggerable")
 
-    def test_ours_full_maps_possible_to_triggerable(self):
+    def test_ours_full_maps_possible_to_reachable_only(self):
         support = support_from_vulnerability(
             {
                 "dependency_chain": ["demo", "gstreamer"],
@@ -107,9 +108,9 @@ class InternalBaselinesTests(unittest.TestCase):
             }
         )
         projected = project_ours_full_from_support(support, gold_label="triggerable")
-        self.assertEqual(projected["predicted_label"], "triggerable")
+        self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
         self.assertEqual(projected["run_status"], "triggerable_possible")
-        self.assertEqual(projected["correct"], "yes")
+        self.assertEqual(projected["correct"], "no")
 
     def test_ours_full_maps_false_positive_to_reachable_only(self):
         support = support_from_vulnerability(
@@ -128,6 +129,121 @@ class InternalBaselinesTests(unittest.TestCase):
         projected = project_ours_full_from_support(support, gold_label="reachable_but_not_triggerable")
         self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
         self.assertEqual(projected["native_internal_satisfied"], "no")
+        self.assertEqual(projected["correct"], "yes")
+
+    def test_accuracy_first_demotes_possible_to_reachable_only(self):
+        support = support_from_vulnerability(
+            {
+                "dependency_chain": ["demo", "gstreamer"],
+                "native_component_instances": [{"component": "gstreamer"}],
+                "resolved_version": "0.24.4",
+                "version_range": "<1.22.9",
+                "reachable": True,
+                "call_reachability_source": "rust_native_gateway_package",
+                "triggerable": "possible",
+                "source_status": "system",
+            }
+        )
+        projected = project_ours_accuracy_first_from_support(
+            support,
+            gold_label="reachable_but_not_triggerable",
+        )
+        self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
+        self.assertEqual(projected["run_status"], "triggerable_possible")
+        self.assertEqual(projected["native_internal_satisfied"], "partial")
+        self.assertEqual(projected["correct"], "yes")
+
+    def test_accuracy_first_demotes_possible_even_with_wrapper_bridge_evidence(self):
+        support = support_from_vulnerability(
+            {
+                "dependency_chain": ["webpx", "libwebp"],
+                "native_component_instances": [{"component": "libwebp"}],
+                "resolved_version": "1.2.2",
+                "version_range": "<1.3.2",
+                "reachable": True,
+                "call_reachability_source": "rust_call_package",
+                "triggerable": "possible",
+                "source_status": "system",
+                "downgrade_reason": "source_status=system;preserved_by_wrapper_sink_evidence",
+                "evidence_notes": [
+                    "Cross-language bridge satisfied by explicit native symbol reference in Rust wrapper: WebPDecode."
+                ],
+            }
+        )
+        self.assertEqual(support.cross_language_linked, "yes")
+        projected = project_ours_accuracy_first_from_support(
+            support,
+            gold_label="triggerable",
+        )
+        self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
+        self.assertEqual(projected["run_status"], "triggerable_possible")
+        self.assertEqual(projected["native_internal_satisfied"], "partial")
+        self.assertEqual(projected["correct"], "no")
+
+    def test_accuracy_first_demotes_possible_even_with_direct_native_gateway_bridge(self):
+        support = support_from_vulnerability(
+            {
+                "dependency_chain": ["photohash", "libjpeg-turbo"],
+                "native_component_instances": [{"component": "libjpeg-turbo"}],
+                "package": "libjpeg-turbo",
+                "resolved_version": "2.1.2",
+                "version_range": "<2.1.5.1",
+                "reachable": True,
+                "call_reachability_source": "rust_native_gateway_package",
+                "triggerable": "possible",
+                "source_status": "system",
+                "downgrade_reason": "direct_native_gateway_bridge;native_dependency_graph_incomplete",
+                "conditions": {
+                    "trigger_model_hits": {
+                        "required_hits": [
+                            {
+                                "id": "jpeg_header_any",
+                                "evidence": [{"name": "decompress", "lang": "Rust"}],
+                            }
+                        ]
+                    }
+                },
+                "evidence_notes": [
+                    "Direct native gateway calls recovered from source scan.",
+                ],
+            }
+        )
+        self.assertEqual(support.cross_language_linked, "yes")
+        projected = project_ours_accuracy_first_from_support(
+            support,
+            gold_label="triggerable",
+        )
+        self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
+        self.assertEqual(projected["run_status"], "triggerable_possible")
+        self.assertEqual(projected["native_internal_satisfied"], "partial")
+        self.assertEqual(projected["correct"], "no")
+
+    def test_accuracy_first_demotes_libjpeg_gateway_without_header_trigger_hit(self):
+        support = support_from_vulnerability(
+            {
+                "dependency_chain": ["globject-rs", "libjpeg-turbo"],
+                "native_component_instances": [{"component": "libjpeg-turbo"}],
+                "package": "libjpeg-turbo",
+                "resolved_version": "2.1.2",
+                "version_range": "<2.1.5.1",
+                "reachable": True,
+                "call_reachability_source": "rust_native_gateway_package",
+                "triggerable": "possible",
+                "source_status": "system",
+                "downgrade_reason": "direct_native_gateway_bridge",
+                "evidence_notes": [
+                    "Direct native gateway calls recovered from source scan.",
+                ],
+            }
+        )
+        self.assertEqual(support.cross_language_linked, "no")
+        projected = project_ours_accuracy_first_from_support(
+            support,
+            gold_label="reachable_but_not_triggerable",
+        )
+        self.assertEqual(projected["predicted_label"], "reachable_but_not_triggerable")
+        self.assertEqual(projected["run_status"], "triggerable_possible")
+        self.assertEqual(projected["native_internal_satisfied"], "partial")
         self.assertEqual(projected["correct"], "yes")
 
 

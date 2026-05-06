@@ -2,7 +2,7 @@ import os
 
 
 def neo4j_uri() -> str:
-    return os.environ.get("CPG_NEO4J_URI", "bolt://localhost:7687")
+    return os.environ.get("CPG_NEO4J_URI", "bolt://localhost:8687")
 
 
 def neo4j_auth() -> tuple[str, str]:
